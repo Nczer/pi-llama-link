@@ -1,0 +1,10 @@
+{
+  "name": "pi-llama-status",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

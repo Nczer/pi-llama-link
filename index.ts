@@ -846,6 +846,11 @@ async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Pro
     return;
   }
 
+  // Start SSE listener to pick up loading progress
+  if (!isSseActive()) {
+    startSseForServer(server.id, ctx);
+  }
+
   // If a model ID was provided directly, load it
   if (modelArg) {
     try {
@@ -853,7 +858,11 @@ async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Pro
       ctx.ui.notify(`Loading ${modelArg} on ${server.name}`, "info");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      ctx.ui.notify(`Failed to load: ${msg}`, "error");
+      if (msg.includes("already running") || msg.includes("already loaded")) {
+        ctx.ui.notify(`${modelArg} is already loaded`, "info");
+      } else {
+        ctx.ui.notify(`Failed to load: ${msg}`, "error");
+      }
     }
     return;
   }
@@ -890,7 +899,11 @@ async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Pro
     ctx.ui.notify(`Loading ${displayName} on ${server.name}`, "info");
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    ctx.ui.notify(`Failed to load: ${msg}`, "error");
+    if (msg.includes("already running") || msg.includes("already loaded")) {
+      ctx.ui.notify(`${displayName} is already loaded`, "info");
+    } else {
+      ctx.ui.notify(`Failed to load: ${msg}`, "error");
+    }
   }
 }
 
@@ -984,6 +997,295 @@ async function syncToModelsJson(): Promise<boolean> {
 // Track which server:model combos have been discovered to avoid duplicate queries
 const discoveredMetadata = new Set<string>();
 const pendingMetadata = new Set<string>();
+
+// ── SSE Model Loading Progress ────────────────────────────────────────
+
+interface SseProgress {
+  stages?: string[];   // ["text_model", "spec_model", "mmproj_model"]
+  current?: string;    // "text_model", "spec_model", "mmproj_model"
+  stage?: string;      // older format: single stage name
+  value?: number;      // 0.0 — 1.0
+}
+
+interface ModelLoadState {
+  status: string;      // "loading", "loaded", "sleeping", "unloaded"
+  progress?: SseProgress;
+  modelId?: string;
+}
+
+// Per-model load state tracked from SSE events
+const loadStateMap = new Map<string, ModelLoadState>();
+
+// Active SSE connection state
+let sseAbort: AbortController | null = null;
+let sseServerId: string | "" = "";
+let sseCtx: ExtensionContext | null = null;
+let sseReconnectTimer: NodeJS.Timeout | null = null;
+let sseReconnectAttempts = 0;
+const SSE_MAX_RECONNECT_ATTEMPTS = 10;
+const SSE_INITIAL_RECONNECT_MS = 1000;
+
+/** Stage name → human-readable label */
+const STAGE_LABELS: Record<string, string> = {
+  "fit_params": "fitting params",
+  "text_model": "loading model",
+  "mmproj_model": "loading mmproj",
+};
+
+/** Format a stage name for display */
+function formatStage(stage: string): string {
+  return STAGE_LABELS[stage] || stage;
+}
+
+/**
+ * Format the loading progress string for the status bar.
+ * Matches tps/gallop style: dim prefix, accent for key values, dim for detail.
+ */
+function formatLoadingProgress(state: ModelLoadState, theme: any): string {
+  const dim = (s: string) => theme.fg("dim", s);
+  const accent = (s: string) => theme.fg("accent", s);
+  const success = (s: string) => theme.fg("success", s);
+
+  if (state.status === "loading" && state.progress) {
+    const prog = state.progress;
+    const stage = prog.current || prog.stage;
+    const value = prog.value;
+
+    if (stage && value !== undefined) {
+      const pct = Math.round(value * 100);
+      if (stage === "fit_params") {
+        return `${dim("· ")}${accent("Loading")} ${dim(`${formatStage(stage)}...`)}`;
+      }
+      return `${dim("· ")}${accent("Loading")} ${dim(`${formatStage(stage)} ${pct}%`)}`;
+    }
+  }
+
+  if (state.status === "loading") {
+    return `${dim("· ")}${accent("Loading")} ${dim("model...")}`;
+  }
+
+  if (state.status === "loaded") {
+    return `${success("✓")} ${dim("loaded")}`;
+  }
+
+  return "";
+}
+
+/**
+ * Parse SSE stream from a Response body.
+ * Yields parsed JSON objects from "data:" lines.
+ */
+async function* parseSseStream(response: Response): AsyncGenerator<string> {
+  if (!response.body) return;
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() || "";
+
+      for (const part of parts) {
+        const lines = part.split("\n");
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith("data:")) {
+            const json = trimmed.slice(5).trim();
+            if (json) yield json;
+          }
+        }
+      }
+    }
+
+    // Process remaining buffer
+    if (buffer.trim()) {
+      const lines = buffer.split("\n");
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("data:")) {
+          const json = trimmed.slice(5).trim();
+          if (json) yield json;
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
+ * Connect to /models/sse and process status_change events.
+ * Reconnects with exponential backoff on disconnect (up to max attempts).
+ */
+async function connectSse(
+  server: ServerConfig,
+  ctx: ExtensionContext,
+): Promise<void> {
+  const apiKey = resolveApiKey(server.id);
+  const url = `${server.url}/models/sse`;
+
+  sseAbort = new AbortController();
+  sseCtx = ctx;
+  sseServerId = server.id;
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "Accept": "text/event-stream",
+        ...(apiKey && apiKey !== API_KEY_PLACEHOLDER
+          ? { Authorization: `Bearer ${apiKey}` }
+          : {}),
+      },
+      signal: sseAbort.signal,
+    });
+
+    if (!response.ok) {
+      // SSE endpoint not available (e.g., single-model mode or old server)
+      return;
+    }
+
+    sseReconnectAttempts = 0; // Reset reconnect counter on successful connect
+
+    for await (const jsonStr of parseSseStream(response)) {
+      try {
+        const event = JSON.parse(jsonStr);
+        handleSseEvent(event, server.id, ctx);
+      } catch {
+        // Skip malformed SSE data lines
+      }
+    }
+  } catch (err: any) {
+    const msg = err?.name || err?.message || String(err);
+    // AbortError is expected when we intentionally disconnect
+    if (msg === "AbortError" || msg === "aborted") return;
+
+    // Server error or network failure — attempt reconnect
+    attemptSseReconnect(server, ctx);
+  }
+}
+
+/**
+ * Attempt to reconnect SSE with exponential backoff.
+ */
+function attemptSseReconnect(
+  server: ServerConfig,
+  ctx: ExtensionContext,
+): void {
+  if (sseReconnectAttempts >= SSE_MAX_RECONNECT_ATTEMPTS) {
+    return;
+  }
+
+  sseReconnectAttempts++;
+  const delay = Math.min(
+    SSE_INITIAL_RECONNECT_MS * Math.pow(2, sseReconnectAttempts - 1),
+    30000, // Cap at 30s
+  );
+
+  sseReconnectTimer = setTimeout(() => {
+    connectSse(server, ctx);
+  }, delay);
+}
+
+/**
+ * Handle a parsed SSE data line.
+ * SSE format: data: {"model":"...","event":"status_change","data":{"status":"loading","progress":{...}}}
+ * The JSON has: model, event, data (with status + progress inside).
+ */
+function handleSseEvent(
+  payload: any,
+  serverId: string,
+  ctx: ExtensionContext,
+): void {
+  if (!payload || !payload.model) return;
+
+  // payload.data contains {status, progress, ...}
+  const inner = payload.data;
+  if (!inner || !inner.status) return;
+
+  const modelId = payload.model;
+  const status = inner.status;
+  const progress = inner.progress;
+
+  // Track state per model
+  const state: ModelLoadState = {
+    status,
+    progress: progress || undefined,
+    modelId,
+  };
+  loadStateMap.set(modelId, state);
+
+  // Update status bar if this model belongs to the active server
+  if (serverId === sseServerId && sseCtx) {
+    try {
+      const theme = ctx.ui.theme;
+      const progressStr = formatLoadingProgress(state, theme);
+      if (progressStr) {
+        ctx.ui.setStatus("llama", progressStr);
+      }
+
+      // Clear status bar when model is fully loaded
+      if (status === "loaded") {
+        const progressStr = formatLoadingProgress(state, theme);
+        ctx.ui.setStatus("llama", progressStr);
+        // Clear after a delay so user sees the loaded confirmation
+        setTimeout(() => {
+          if (sseCtx) {
+            try { sseCtx.ui.setStatus("llama", undefined); } catch {}
+          }
+        }, 5000);
+      }
+    } catch {
+      // Context may be stale after session end
+    }
+  }
+}
+
+/**
+ * Stop the active SSE connection and clear state.
+ */
+function stopSse(): void {
+  if (sseReconnectTimer) {
+    clearTimeout(sseReconnectTimer);
+    sseReconnectTimer = null;
+  }
+  if (sseAbort) {
+    sseAbort.abort();
+    sseAbort = null;
+  }
+  sseServerId = "";
+  sseReconnectAttempts = 0;
+}
+
+/**
+ * Start SSE listener for a server if not already connected.
+ */
+function startSseForServer(serverId: string, ctx: ExtensionContext): void {
+  // If already connected to this server, keep it
+  if (sseServerId === serverId) return;
+
+  // Stop existing connection
+  stopSse();
+
+  const servers = resolveServers();
+  const server = servers.find((s) => s.id === serverId);
+  if (!server) return;
+
+  // Start SSE connection
+  connectSse(server, ctx);
+}
+
+/**
+ * Check if SSE is connected to a llama-cpp provider.
+ */
+function isSseActive(): boolean {
+  return sseServerId !== "" && PROVIDER_IDS.includes(sseServerId);
+}
 
 // ── Metadata Overlay ──────────────────────────────────────────────────
 // Persists model capabilities (thinking, context size) per server:model so it survives model syncs.
@@ -1174,6 +1476,40 @@ export default function llamaStatusExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event: any, ctx: ExtensionContext) => {
     if (!isLlamaStatusEnabled()) return;
     try { await syncToModelsJson(); } catch {}
+  });
+
+  // ── SSE Model Loading Progress ──────────────────────────────────────
+
+  // Connect SSE listener early on session start to catch auto-load events
+  pi.on("session_start", async (_event: any, ctx: ExtensionContext) => {
+    if (!isLlamaStatusEnabled()) return;
+    const provider = (ctx.model as any)?.provider;
+    if (provider && PROVIDER_IDS.includes(provider) && !isSseActive()) {
+      startSseForServer(provider, ctx);
+    }
+  });
+
+  // Reconnect SSE if model changes during session
+  pi.on("model_select", async (event: any, ctx: ExtensionContext) => {
+    if (!isLlamaStatusEnabled()) return;
+    const provider = (event.model as any)?.provider;
+    if (!provider || !PROVIDER_IDS.includes(provider)) {
+      // Switched away from llama-cpp — stop SSE
+      stopSse();
+      return;
+    }
+
+    // If SSE is already active for this provider, keep it
+    if (isSseActive() && sseServerId === provider) return;
+
+    startSseForServer(provider, ctx);
+  });
+
+  // Clean up SSE connection on session shutdown
+  pi.on("session_shutdown", async () => {
+    stopSse();
+    sseCtx = null;
+    loadStateMap.clear();
   });
 
   // ── Additional Commands ─────────────────────────────────────────────
