@@ -986,8 +986,8 @@ async function syncToModelsJson(): Promise<boolean> {
     }, 1000);
   }
 
-  // Prune metadata for removed/renamed models
-  cleanupStaleMetadata(validModels);
+  // Prune metadata for removed/renamed models (only for reachable servers)
+  cleanupStaleMetadata(validModels, serverInfo.map((s) => s.server.id));
 
   return wrote;
 }
@@ -1311,10 +1311,13 @@ function saveMetadataOverlay(metadata: ModelMetadata): void {
   }, 1000);
 }
 
-function cleanupStaleMetadata(validModels: Map<string, Set<string>>): void {
+function cleanupStaleMetadata(validModels: Map<string, Set<string>>, reachableServers: string[]): void {
   const overlay = loadMetadataOverlay();
   let pruned = false;
   for (const serverId of Object.keys(overlay)) {
+    // Skip servers that weren't reachable — don't delete their metadata
+    if (!reachableServers.includes(serverId)) continue;
+
     const valid = validModels.get(serverId);
     if (!valid) {
       delete overlay[serverId];
