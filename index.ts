@@ -191,10 +191,11 @@ let metadataWriteTimer: NodeJS.Timeout | null = null;
 function loadSettings(): Record<string, any> {
   if (cachedSettings !== undefined) return cachedSettings;
   const path = join(process.env.HOME || ".", ".pi", "agent", "settings.json");
+  let settings: Record<string, any> = {};
   if (existsSync(path)) {
-    try { return JSON.parse(readFileSync(path, "utf-8")); } catch {}
+    try { settings = JSON.parse(readFileSync(path, "utf-8")); } catch {}
   }
-  return (cachedSettings = {});
+  return (cachedSettings = settings);
 }
 
 function resolveLocalUrl(): string {
@@ -342,11 +343,14 @@ function parsePrometheusMetrics(text: string): MetricsData {
 
 async function fetchMetrics(server: ServerConfig, modelId?: string): Promise<MetricsData> {
   const qs = modelId ? `?model=${encodeURIComponent(modelId)}` : "";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT);
   try {
     const url = `${server.url}/metrics${qs}`;
     const apiKey = resolveApiKey(server.id);
     const res = await fetch(url, {
       headers: apiKey && apiKey !== API_KEY_PLACEHOLDER ? { Authorization: `Bearer ${apiKey}` } : {},
+      signal: controller.signal,
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const text = await res.text();
@@ -358,6 +362,8 @@ async function fetchMetrics(server: ServerConfig, modelId?: string): Promise<Met
       prompt_tokens_per_second: null, predicted_tokens_per_second: null,
       requests_processing: null, requests_deferred: null,
     };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -380,8 +386,8 @@ class ModelInspector {
   private cachedData: ModelsDataProperty[] | null = null;
   private cachedMode: ServerMode | null = null;
   private cachedProps: PropsResponse | null = null;
-  private cachedSlots: SlotInfo[] | null = null;
-  private cachedMetrics: MetricsData | null = null;
+  private cachedSlots = new Map<string, SlotInfo[]>();
+  private cachedMetrics = new Map<string, MetricsData>();
   private cachedV1Models: V1ModelInfo[] | null = null;
 
   constructor(
@@ -436,7 +442,7 @@ class ModelInspector {
       try {
         this.cachedProps = await rpc<PropsResponse>(this.server, "/props");
       } catch {
-        this.cachedProps = { is_sleeping: false };
+        this.cachedProps = { is_sleeping: false, error: { code: 0, message: "props request failed" } };
       }
     }
     return this.cachedProps;
@@ -484,14 +490,15 @@ class ModelInspector {
   // ── Slots ───────────────────────────────────────────────────────────
 
   async getSlots(modelId?: string): Promise<SlotInfo[]> {
-    if (!this.cachedSlots) {
-      this.cachedSlots = await fetchSlots(this.server, modelId);
+    const key = modelId ?? "";
+    if (!this.cachedSlots.has(key)) {
+      this.cachedSlots.set(key, await fetchSlots(this.server, modelId));
     }
-    return this.cachedSlots;
+    return this.cachedSlots.get(key)!;
   }
 
   getSlotInfo(modelId?: string): { decoded: number; remain: number; totalSlots: number; activeSlots: number } {
-    const slots = this.cachedSlots || [];
+    const slots = this.cachedSlots.get(modelId ?? "") || [];
     const active = slots.filter((s) => s.is_processing);
     let decoded = 0, remain = -1;
     for (const s of active) {
@@ -506,10 +513,11 @@ class ModelInspector {
   // ── Metrics ─────────────────────────────────────────────────────────
 
   async getMetrics(modelId?: string): Promise<MetricsData> {
-    if (!this.cachedMetrics) {
-      this.cachedMetrics = await fetchMetrics(this.server, modelId);
+    const key = modelId ?? "";
+    if (!this.cachedMetrics.has(key)) {
+      this.cachedMetrics.set(key, await fetchMetrics(this.server, modelId));
     }
-    return this.cachedMetrics;
+    return this.cachedMetrics.get(key)!;
   }
 
   // ── V1 Models (rich metadata) ──────────────────────────────────────
@@ -749,7 +757,6 @@ async function showStatus(ctx: ExtensionCommandContext): Promise<void> {
 
   await ctx.ui.custom<void>(
     (tui, theme, _keybindings, done) => {
-      let currentWidth = OVERLAY_WIDTH;
       return {
         handleInput(data: string) {
           if (matchesKey(data, "escape") || matchesKey(data, "q")) {
@@ -757,8 +764,6 @@ async function showStatus(ctx: ExtensionCommandContext): Promise<void> {
           }
         },
         render(width: number): string[] {
-          const w = Math.max(OVERLAY_WIDTH, width);
-          if (w !== currentWidth) currentWidth = w;
           const overlayLines = [
             theme.bold(theme.fg("accent", `${PROVIDER_NAME} Status`)),
             "",
@@ -768,7 +773,7 @@ async function showStatus(ctx: ExtensionCommandContext): Promise<void> {
             "",
             "Press Escape or q to close",
           ];
-          return buildBorderDynamic(theme, overlayLines, currentWidth);
+          return buildBorderDynamic(theme, overlayLines, width);
         },
         invalidate() {},
       };
@@ -779,7 +784,7 @@ async function showStatus(ctx: ExtensionCommandContext): Promise<void> {
         anchor: "center",
         width: "80%",
         // maxWidth: OVERLAY_WIDTH,
-        minWidth: 50,
+        minWidth: OVERLAY_WIDTH,
         maxHeight: "90%",
       },
     },
@@ -918,7 +923,7 @@ function loadModelsJson(): ModelsJson {
 
 function modelsChanged(
   existing: any[],
-  incoming: Array<{ id: string; contextWindow: number; reasoning?: boolean }>,
+  incoming: Array<{ id: string; name: string; contextWindow: number; input: string[]; reasoning?: boolean }>,
 ): boolean {
   if (existing.length !== incoming.length) return true;
   const existingMap = new Map(existing.map((m: any) => [m.id, m]));
@@ -926,7 +931,9 @@ function modelsChanged(
     const match = existingMap.get(m.id);
     if (!match) return true;
     if (match.contextWindow !== m.contextWindow) return true;
-    if (m.reasoning !== match.reasoning) return true;
+    if (Boolean(m.reasoning) !== Boolean(match.reasoning)) return true;
+    if (match.name !== m.name) return true;
+    if ((match.input || []).join(",") !== m.input.join(",")) return true;
   }
   return false;
 }
@@ -955,14 +962,16 @@ async function syncToModelsJson(): Promise<boolean> {
         ),
         contextWindow,
         maxTokens: Math.min(32000, contextWindow),
+        reasoning: false,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       };
     });
 
+    const overlay = loadMetadataOverlay();
     const modelsWithOverlay = modelConfigs.map(m => {
       const { id, name, input, contextWindow, maxTokens, cost } = m;
       const result: any = { id, name, input, contextWindow, maxTokens, cost };
-      applyMetadataOverlay(result, server.id);
+      applyMetadataOverlay(result, server.id, overlay);
       return result;
     });
 
@@ -1013,15 +1022,13 @@ interface ModelLoadState {
   modelId?: string;
 }
 
-// Per-model load state tracked from SSE events
-const loadStateMap = new Map<string, ModelLoadState>();
-
 // Active SSE connection state
 let sseAbort: AbortController | null = null;
 let sseServerId: string | "" = "";
 let sseCtx: ExtensionContext | null = null;
 let sseReconnectTimer: NodeJS.Timeout | null = null;
 let sseReconnectAttempts = 0;
+let sseClearToken = 0;
 const SSE_MAX_RECONNECT_ATTEMPTS = 10;
 const SSE_INITIAL_RECONNECT_MS = 1000;
 
@@ -1147,6 +1154,7 @@ async function connectSse(
 
     if (!response.ok) {
       // SSE endpoint not available (e.g., single-model mode or old server)
+      stopSse();
       return;
     }
 
@@ -1218,8 +1226,6 @@ function handleSseEvent(
     progress: progress || undefined,
     modelId,
   };
-  loadStateMap.set(modelId, state);
-
   // Update status bar if this model belongs to the active server
   if (serverId === sseServerId && sseCtx) {
     try {
@@ -1229,13 +1235,13 @@ function handleSseEvent(
         ctx.ui.setStatus("llama", progressStr);
       }
 
-      // Clear status bar when model is fully loaded
+      // Clear status bar when model is fully loaded.
+      // Token guard: a newer loading event increments sseClearToken,
+      // so a stale 5s timer won't clobber the freshly-set status.
       if (status === "loaded") {
-        const progressStr = formatLoadingProgress(state, theme);
-        ctx.ui.setStatus("llama", progressStr);
-        // Clear after a delay so user sees the loaded confirmation
+        const token = ++sseClearToken;
         setTimeout(() => {
-          if (sseCtx) {
+          if (sseCtx && token === sseClearToken) {
             try { sseCtx.ui.setStatus("llama", undefined); } catch {}
           }
         }, 5000);
@@ -1260,6 +1266,7 @@ function stopSse(): void {
   }
   sseServerId = "";
   sseReconnectAttempts = 0;
+  sseClearToken = 0;
 }
 
 /**
@@ -1348,9 +1355,9 @@ function persistModelMetadata(serverId: string, modelId: string, data: { thinkin
   saveMetadataOverlay(overlay);
 }
 
-function applyMetadataOverlay(model: ProviderModelConfig, serverId: string): void {
-  const overlay = loadMetadataOverlay();
-  const entry = overlay[serverId]?.[model.id];
+function applyMetadataOverlay(model: ProviderModelConfig, serverId: string, overlay?: ModelMetadata): void {
+  const data = overlay ?? loadMetadataOverlay();
+  const entry = data[serverId]?.[model.id];
   if (!entry) return;
   if (entry.thinking) {
     if (entry.thinking === "chat-template") {
@@ -1512,7 +1519,12 @@ export default function llamaStatusExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     stopSse();
     sseCtx = null;
-    loadStateMap.clear();
+    if (modelsWriteTimer) { clearTimeout(modelsWriteTimer); modelsWriteTimer = null; }
+    if (metadataWriteTimer) { clearTimeout(metadataWriteTimer); metadataWriteTimer = null; }
+    cachedSettings = undefined;
+    apiKeyCache.clear();
+    discoveredMetadata.clear();
+    pendingMetadata.clear();
   });
 
   // ── Additional Commands ─────────────────────────────────────────────
@@ -1520,7 +1532,13 @@ export default function llamaStatusExtension(pi: ExtensionAPI) {
   pi.registerCommand("llama-version", {
     description: "Print llama-server --version output",
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      const result = await pi.exec("llama-server", ["--version"]);
+      let result;
+      try {
+        result = await pi.exec("llama-server", ["--version"]);
+      } catch {
+        ctx.ui.notify("llama-server not found on PATH", "error");
+        return;
+      }
       const output = `${result.stderr ?? ""}\n${result.stdout ?? ""}`;
       const versionLine = output
         .split("\n")
@@ -1546,7 +1564,7 @@ export default function llamaStatusExtension(pi: ExtensionAPI) {
     if (budget === undefined) return;
 
     return {
-      ...event.payload,
+      ...(event.payload as Record<string, unknown>),
       thinking_budget_tokens: budget,
     };
   });
