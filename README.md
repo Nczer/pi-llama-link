@@ -1,6 +1,6 @@
-# llama-status
+# llama-link
 
-Llama.cpp server status indicator, model load/unload, and `models.json` sync for Pi.
+Llama.cpp server integration link, model load/unload, and `models.json` sync for Pi.
 
 ## Commands
 
@@ -12,7 +12,7 @@ Llama.cpp server status indicator, model load/unload, and `models.json` sync for
 | `/llama-load <id>` | Load a specific model by ID (router mode) |
 | `/llama-sync` | Manually sync all server models to `models.json` |
 | `/llama-version` | Print `llama-server --version` output |
-| `/llama-status` | Toggle llama-status extension on/off |
+| `/llama-link` | Toggle llama-link extension on/off |
 
 ## Servers
 
@@ -35,7 +35,7 @@ Priority order: `.pi/llama-server.json` → `LLAMA_SERVER_URL` env → `settings
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `llamaStatusEnabled` | `true` | Toggle extension on/off via `/llama-status` |
+| `llamaLinkEnabled` | `true` | Toggle extension on/off via `/llama-link` |
 | `llamaServerUrl` | `http://127.0.0.1:8080` | Local server URL (overridden by env var) |
 | `llamaServerRemoteUrl` | None | Remote server URL (opt-in) |
 

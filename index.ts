@@ -33,7 +33,7 @@ const PROVIDER_IDS = ["llama-cpp", "llama-cpp-remote", "llama-server"];
 const apiKeyCache = new Map<string, string>();
 const RPC_TIMEOUT = 2000; // 2s timeout for all server requests
 const PROPS_TIMEOUT_MS = 120_000; // 2min timeout for /props (model loading can be slow)
-const SETTING_KEY = "llamaStatusEnabled";
+const SETTING_KEY = "llamaLinkEnabled";
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -1452,7 +1452,7 @@ async function discoverModelMetadata(
 
 // ── Extension Entry ───────────────────────────────────────────────────
 
-export default function llamaStatusExtension(pi: ExtensionAPI) {
+export default function llamaLinkExtension(pi: ExtensionAPI) {
   pi.registerCommand("llama-model", {
     description: `${PROVIDER_NAME} status indicator`,
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
@@ -1584,14 +1584,14 @@ export default function llamaStatusExtension(pi: ExtensionAPI) {
     );
   });
 
-  pi.registerCommand("llama-status", {
-    description: "Toggle llama-status extension on/off",
+  pi.registerCommand("llama-link", {
+    description: "Toggle llama-link extension on/off",
     handler: async (_args, ctx) => {
       const settings = loadSettings();
       settings[SETTING_KEY] = !settings[SETTING_KEY];
       mkdirSync(join(process.env.HOME || ".", ".pi", "agent"), { recursive: true });
       writeFileSync(join(process.env.HOME || ".", ".pi", "agent", "settings.json"), JSON.stringify(settings, null, 2) + "\n");
-      ctx.ui.notify(settings[SETTING_KEY] ? "Llama status enabled" : "Llama status disabled", settings[SETTING_KEY] ? "info" : "warning");
+      ctx.ui.notify(settings[SETTING_KEY] ? "Llama link enabled" : "Llama link disabled", settings[SETTING_KEY] ? "info" : "warning");
     },
   });
 
