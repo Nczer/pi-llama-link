@@ -123,14 +123,13 @@ interface ModelsJson {
 
 // Thinking budget (tokens) mapped from Pi thinking levels.
 // Injected as thinking_budget_tokens in the request body for llama-cpp providers.
-// off: rely on enable_thinking: false (no budget injection)
-// xhigh: unrestricted (server default -1, no budget injection)
+// off: no budget injection (thinking disabled)
+// max: unrestricted (server default -1, no budget injection)
 const THINKING_BUDGET_MAP: Record<string, number | undefined> = {
   off: undefined,
   low: 512,
-  medium: 2048,
   high: 8192,
-  xhigh: undefined,
+  max: undefined,
 };
 
 // Qwen-style: chat_template_kwargs.enable_thinking (boolean toggle).
@@ -141,20 +140,22 @@ const QWEN_THINKING_LEVEL_MAP = {
   off: "off",
   minimal: null,
   low: "on",
-  medium: "on",
+  medium: null,
   high: "on",
-  xhigh: "on",
+  xhigh: null,
+  max: "on",
 } satisfies NonNullable<ProviderModelConfig["thinkingLevelMap"]>;
 
 // DeepSeek-style: chat_template_kwargs.thinking (effort string).
 // Maps every Pi level to a distinct effort value via chatTemplateKwargs.
 const CHAT_TEMPLATE_THINKING_LEVEL_MAP = {
   off: null,
-  minimal: "minimal",
+  minimal: null,
   low: "low",
-  medium: "medium",
+  medium: null,
   high: "high",
-  xhigh: "max",
+  xhigh: null,
+  max: "max",
 } satisfies NonNullable<ProviderModelConfig["thinkingLevelMap"]>;
 
 // Apply Qwen-style thinking (enable_thinking boolean toggle).
