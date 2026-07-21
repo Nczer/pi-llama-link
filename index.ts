@@ -40,7 +40,7 @@ const SETTING_KEY = "llamaLinkEnabled";
 interface ModelsDataProperty {
   id: string;
   aliases?: string[];
-  status?: { value: string; args?: string[] };
+  status?: { value: string; args?: string[]; failed?: boolean; exit_code?: number };
   architecture?: { input_modalities: string[] };
   meta?: { n_ctx: number; n_ctx_train: number };
 }
@@ -269,31 +269,42 @@ function isLlamaStatusEnabled(): boolean {
 
 // ── HTTP Client (per-server) ──────────────────────────────────────────
 
-async function rpc<T>(server: ServerConfig, endpoint: string, body?: Record<string, unknown>): Promise<T> {
+/** Extract error message from llama.cpp-style { error: { message } } payload */
+function extractError(payload: unknown, fallback: string): string {
+  if (typeof payload !== "object" || payload === null) return fallback;
+  const error = (payload as { error?: { message?: unknown } }).error;
+  return typeof error?.message === "string" && error.message ? error.message : fallback;
+}
+
+async function rpc<T>(server: ServerConfig, endpoint: string, body?: Record<string, unknown>, timeoutMs = RPC_TIMEOUT): Promise<T> {
   const url = `${server.url}${endpoint}`;
   const apiKey = resolveApiKey(server.id);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT);
+  const signal = AbortSignal.timeout(timeoutMs);
 
+  let res: Response;
   try {
-    const res = await fetch(url, {
+    res = await fetch(url, {
       method: body ? "POST" : "GET",
       headers: {
         ...(body ? { "Content-Type": "application/json" } : {}),
         ...(apiKey && apiKey !== API_KEY_PLACEHOLDER ? { Authorization: `Bearer ${apiKey}` } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
+      signal,
     });
-
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-    const text = await res.text();
-    try { return JSON.parse(text); } catch {
-      throw new Error(`Invalid JSON from ${endpoint}`);
-    }
-  } finally {
-    clearTimeout(timer);
+  } catch (err) {
+    throw new Error(err instanceof TypeError ? `Connection failed: ${err.message}` : String(err));
   }
+
+  // Read body first so we can extract error messages even on HTTP errors
+  const text = await res.text();
+  let payload: unknown;
+  try { payload = JSON.parse(text); } catch { payload = undefined; }
+
+  if (!res.ok) throw new Error(extractError(payload, `HTTP ${res.status}: ${res.statusText}`));
+
+  if (payload === undefined) throw new Error(`Invalid JSON from ${endpoint}`);
+  return payload as T;
 }
 
 // ── Additional Endpoints ──────────────────────────────────────────────
@@ -349,14 +360,12 @@ function parsePrometheusMetrics(text: string): MetricsData {
 
 async function fetchMetrics(server: ServerConfig, modelId?: string): Promise<MetricsData> {
   const qs = modelId ? `?model=${encodeURIComponent(modelId)}` : "";
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT);
   try {
     const url = `${server.url}/metrics${qs}`;
     const apiKey = resolveApiKey(server.id);
     const res = await fetch(url, {
       headers: apiKey && apiKey !== API_KEY_PLACEHOLDER ? { Authorization: `Bearer ${apiKey}` } : {},
-      signal: controller.signal,
+      signal: AbortSignal.timeout(RPC_TIMEOUT),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const text = await res.text();
@@ -368,8 +377,6 @@ async function fetchMetrics(server: ServerConfig, modelId?: string): Promise<Met
       prompt_tokens_per_second: null, predicted_tokens_per_second: null,
       requests_processing: null, requests_deferred: null,
     };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -383,7 +390,143 @@ async function fetchV1Models(server: ServerConfig): Promise<V1ModelInfo[]> {
 }
 
 async function loadModel(server: ServerConfig, modelId: string): Promise<void> {
-  await rpc(server, "/models/load", { model: modelId });
+  await rpc(server, "/models/load", { model: modelId }, 30_000);
+}
+
+// ── SSE + Polling Model Load Detection ───────────────────────────────
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(signal.reason ?? new Error("Cancelled")); return; }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, ms);
+    const abort = () => { clearTimeout(timer); reject(signal?.reason ?? new Error("Cancelled")); };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+interface LoadProgress {
+  message: string;
+  ratio?: number;
+}
+
+function parseLoadProgress(data: unknown): LoadProgress | undefined {
+  if (typeof data !== "object" || data === null) return undefined;
+  const progress = (data as { progress?: unknown }).progress;
+  if (typeof progress !== "object" || progress === null) return undefined;
+  const value = progress as { stages?: unknown[]; current?: unknown; stage?: unknown; value?: unknown };
+  const stage = typeof value.current === "string" ? value.current : typeof value.stage === "string" ? value.stage : undefined;
+  if (!stage && typeof value.value !== "number") return undefined;
+  const ratio = typeof value.value === "number" ? Math.max(0, Math.min(1, value.value)) : undefined;
+  return {
+    message: stage ? `Loading ${stage.replace(/_/g, " ")}` : "Loading model",
+    ratio,
+  };
+}
+
+interface WatchResult {
+  loaded: boolean;
+  error?: string;
+}
+
+async function watchModelEvents(
+  server: ServerConfig,
+  modelId: string,
+  signal: AbortSignal,
+  onProgress?: (progress: LoadProgress) => void,
+): Promise<WatchResult> {
+  const apiKey = resolveApiKey(server.id);
+  try {
+    const response = await fetch(`${server.url}/models/sse`, {
+      headers: {
+        "Accept": "text/event-stream",
+        ...(apiKey && apiKey !== API_KEY_PLACEHOLDER ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
+      signal,
+    });
+    if (!response.ok || !response.body) return { loaded: false };
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() || "";
+
+      for (const part of parts) {
+        for (const line of part.split("\n")) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+          try {
+            const event = JSON.parse(trimmed.slice(5).trim());
+            if (event.model !== modelId) continue;
+            if (event.event === "model_status" || event.event === "status_change") {
+              const status = event.data?.status;
+              if (status === "loaded") return { loaded: true };
+              if (status === "unloaded") return { loaded: false, error: "Model failed to load" };
+              if (onProgress) {
+                const progress = parseLoadProgress(event.data);
+                if (progress) onProgress(progress);
+              }
+            }
+          } catch { /* skip malformed events */ }
+        }
+      }
+    }
+    return { loaded: false };
+  } catch {
+    return { loaded: false }; // SSE not available — will rely on polling
+  }
+}
+
+async function loadModelAndWait(
+  server: ServerConfig,
+  modelId: string,
+  ctx: ExtensionCommandContext,
+  signal?: AbortSignal,
+): Promise<void> {
+  const watcher = new AbortController();
+  const combinedSignal = signal ? AbortSignal.any([signal, watcher.signal]) : watcher.signal;
+
+  // Start SSE watcher in background for instant load detection
+  const watchPromise = watchModelEvents(server, modelId, combinedSignal, (progress) => {
+    ctx.ui.setStatus("llama", `· ${progress.message}${progress.ratio !== undefined ? ` ${Math.round(progress.ratio * 100)}%` : ""}`);
+  });
+
+  try {
+    await loadModel(server, modelId);
+    ctx.ui.setStatus("llama", "· Loading model...");
+
+    // Poll until loaded, with SSE events providing early hints
+    while (true) {
+      if (signal?.aborted) throw signal.reason ?? new Error("Cancelled");
+
+      const models = await rpc<ModelsResponse>(server, "/models");
+      const entry = models.data.find((m) => m.id === modelId);
+
+      if (entry?.status?.value === "loaded" || entry?.status?.value === "sleeping") return;
+      if (entry?.status?.value === "unloaded" && entry?.status?.failed) {
+        throw new Error(
+          entry.status.exit_code !== undefined
+            ? `Model exited with code ${entry.status.exit_code}`
+            : "Model failed to load",
+        );
+      }
+
+      await sleep(250, combinedSignal);
+    }
+  } finally {
+    watcher.abort();
+    await watchPromise.catch(() => {});
+    ctx.ui.setStatus("llama", undefined);
+  }
 }
 
 // ── Model Inspector ───────────────────────────────────────────────────
@@ -556,10 +699,10 @@ function isAutoExposedCacheEntry(m: ModelsDataProperty): boolean {
 }
 
 function resolveContextSize(m: ModelsDataProperty): number {
-  // Router mode: parse from status.args (--ctx-size or --fit-ctx)
+  // Router mode: parse from status.args (--ctx-size, -c, -ctx, or --fit-ctx)
   if (m.status?.args) {
     const args = m.status.args;
-    for (const flag of ["--ctx-size", "--fit-ctx"]) {
+    for (const flag of ["--ctx-size", "-c", "-ctx", "--fit-ctx"]) {
       const idx = args.indexOf(flag);
       if (idx !== -1 && args[idx + 1]) {
         const parsed = parseInt(args[idx + 1], 10);
@@ -567,8 +710,9 @@ function resolveContextSize(m: ModelsDataProperty): number {
       }
     }
   }
-  // Single mode: use meta.n_ctx
+  // Single mode: use meta.n_ctx, then n_ctx_train
   if (m.meta?.n_ctx) return m.meta.n_ctx;
+  if (m.meta?.n_ctx_train) return m.meta.n_ctx_train;
   // Fallback default
   return 32768;
 }
@@ -869,8 +1013,8 @@ async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Pro
   // If a model ID was provided directly, load it
   if (modelArg) {
     try {
-      await loadModel(server, modelArg);
-      ctx.ui.notify(`Loading ${modelArg} on ${server.name}`, "info");
+      await loadModelAndWait(server, modelArg, ctx);
+      ctx.ui.notify(`Loaded ${modelArg} on ${server.name}`, "info");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("already running") || msg.includes("already loaded")) {
@@ -910,8 +1054,8 @@ async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Pro
 
   const displayName = selected.aliases?.[0] || selected.id;
   try {
-    await loadModel(server, selected.id);
-    ctx.ui.notify(`Loading ${displayName} on ${server.name}`, "info");
+    await loadModelAndWait(server, selected.id, ctx);
+    ctx.ui.notify(`Loaded ${displayName} on ${server.name}`, "info");
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("already running") || msg.includes("already loaded")) {
@@ -948,7 +1092,12 @@ function modelsChanged(
   return false;
 }
 
-async function syncToModelsJson(): Promise<boolean> {
+let syncNotifyTimer: NodeJS.Timeout | null = null;
+const SYNC_NOTIFY_DURATION = 3000;
+
+async function syncToModelsJson(
+  setStatus?: (value: string | undefined) => void,
+): Promise<boolean> {
   const serverInfo = await gatherServers();
   const config = loadModelsJson();
   let wrote = false;
@@ -1013,6 +1162,15 @@ async function syncToModelsJson(): Promise<boolean> {
       if (pendingModelsStr) writeFileSync(MODELS_JSON, pendingModelsStr);
       modelsWriteTimer = null;
       pendingModelsStr = null;
+      // Show status notification after write completes
+      if (setStatus) {
+        if (syncNotifyTimer) clearTimeout(syncNotifyTimer);
+        setStatus("\u2713 models synced -- /reload to use");
+        syncNotifyTimer = setTimeout(() => {
+          setStatus(undefined);
+          syncNotifyTimer = null;
+        }, SYNC_NOTIFY_DURATION);
+      }
     }, 1000);
   }
 
@@ -1461,7 +1619,7 @@ async function discoverModelMetadata(
     if (!updated) return;
 
     // Lazy re-sync to apply overlay to models.json without blocking
-    void syncToModelsJson().catch(() => {});
+    void syncToModelsJson((v) => u((c) => c.ui.setStatus("llama", v))).catch(() => {});
   } catch (error) {
     const err = error as Error;
     const msg = err.name === "AbortError" ? "timeout" : err.message;
@@ -1508,7 +1666,7 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
   // Auto-sync on session start
   pi.on("session_start", async (_event: any, ctx: ExtensionContext) => {
     if (!isLlamaStatusEnabled()) return;
-    try { await syncToModelsJson(); } catch {}
+    try { await syncToModelsJson((v) => ctx.ui.setStatus("llama", v)); } catch {}
   });
 
   // ── SSE Model Loading Progress ──────────────────────────────────────
