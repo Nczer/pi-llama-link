@@ -219,14 +219,14 @@ function resolveRemoteUrl(): string | undefined {
 function resolveServers(): ServerConfig[] {
   const localUrl = resolveLocalUrl();
   const servers: ServerConfig[] = [
-    { id: "llama-cpp", name: `Local (${localUrl.replace("http://", "")})`, url: localUrl },
+    { id: "llama-cpp", name: `Local (${localUrl.replace(/^https?:\/\//, "")})`, url: localUrl },
   ];
 
   const remoteUrl = resolveRemoteUrl();
   if (remoteUrl) {
     servers.push({
       id: "llama-cpp-remote",
-      name: `Remote (${remoteUrl.replace("http://", "")})`,
+      name: `Remote (${remoteUrl.replace(/^https?:\/\//, "")})`,
       url: remoteUrl,
     });
   }
@@ -535,7 +535,7 @@ class ModelInspector {
 
   async getModelMeta(modelId: string): Promise<V1ModelMeta | null> {
     const v1Models = await this.getV1Models();
-    const m = v1Models.find((v) => v.id === modelId || v.id.endsWith(modelId));
+    const m = v1Models.find((v) => v.id === modelId || v.id.endsWith("/" + modelId));
     return m?.meta || null;
   }
 }
@@ -844,7 +844,10 @@ async function unloadModel(ctx: ExtensionCommandContext): Promise<void> {
 
 async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Promise<void> {
   const servers = resolveServers();
-  const server = servers[0]; // Use local server by default
+  const modelProvider = (ctx.model as any)?.provider;
+  const server = (modelProvider && PROVIDER_IDS.includes(modelProvider))
+    ? findServerByProvider(modelProvider, servers) || servers[0]
+    : servers[0];
 
   let ready = false;
   try {
@@ -1424,7 +1427,6 @@ async function discoverModelMetadata(
 
     if (!response.ok) {
       u((c) => c.ui.notify(`[llama-cpp] /props for ${modelId} returned ${response.status}`, "error"));
-      discoveredMetadata.add(key);
       return;
     }
 
