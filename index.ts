@@ -188,6 +188,8 @@ function applyChatTemplateThinkingSupport(model: Record<string, any>): void {
 let cachedSettings: Record<string, any> | undefined;
 let modelsWriteTimer: NodeJS.Timeout | null = null;
 let metadataWriteTimer: NodeJS.Timeout | null = null;
+let pendingModelsStr: string | null = null;
+let pendingMetadataStr: string | null = null;
 
 function loadSettings(): Record<string, any> {
   if (cachedSettings !== undefined) return cachedSettings;
@@ -477,6 +479,7 @@ class ModelInspector {
     }
     // Single mode: check /props once for the server
     const props = await this.getProps();
+    if (data.length === 0) return [];
     if (props.is_sleeping) {
       const model = data[0];
       return [{ id: model.id, name: model.aliases?.[0] || model.id, status: "sleeping" }];
@@ -988,11 +991,22 @@ async function syncToModelsJson(): Promise<boolean> {
     wrote = true;
   }
 
+  // Prune provider entries for servers no longer configured
+  const resolvedIds = new Set(resolveServers().map(s => s.id));
+  for (const key of Object.keys(config.providers)) {
+    if (!PROVIDER_IDS.includes(key)) continue;
+    if (resolvedIds.has(key)) continue;
+    delete config.providers[key];
+    wrote = true;
+  }
+
   if (wrote) {
     if (modelsWriteTimer) clearTimeout(modelsWriteTimer);
+    pendingModelsStr = JSON.stringify(config, null, 2) + "\n";
     modelsWriteTimer = setTimeout(() => {
-      writeFileSync(MODELS_JSON, JSON.stringify(config, null, 2) + "\n");
+      if (pendingModelsStr) writeFileSync(MODELS_JSON, pendingModelsStr);
       modelsWriteTimer = null;
+      pendingModelsStr = null;
     }, 1000);
   }
 
@@ -1187,6 +1201,7 @@ function attemptSseReconnect(
   ctx: ExtensionContext,
 ): void {
   if (sseReconnectAttempts >= SSE_MAX_RECONNECT_ATTEMPTS) {
+    stopSse(); // Clear stale state so isSseActive() returns false
     return;
   }
 
@@ -1313,9 +1328,11 @@ function loadMetadataOverlay(): ModelMetadata {
 
 function saveMetadataOverlay(metadata: ModelMetadata): void {
   if (metadataWriteTimer) clearTimeout(metadataWriteTimer);
+  pendingMetadataStr = JSON.stringify(metadata, null, 2) + "\n";
   metadataWriteTimer = setTimeout(() => {
-    writeFileSync(METADATA_JSON, JSON.stringify(metadata, null, 2) + "\n");
+    if (pendingMetadataStr) writeFileSync(METADATA_JSON, pendingMetadataStr);
     metadataWriteTimer = null;
+    pendingMetadataStr = null;
   }, 1000);
 }
 
@@ -1520,6 +1537,9 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     stopSse();
     sseCtx = null;
+    // Flush pending debounced writes before clearing
+    if (pendingModelsStr) { writeFileSync(MODELS_JSON, pendingModelsStr); pendingModelsStr = null; }
+    if (pendingMetadataStr) { writeFileSync(METADATA_JSON, pendingMetadataStr); pendingMetadataStr = null; }
     if (modelsWriteTimer) { clearTimeout(modelsWriteTimer); modelsWriteTimer = null; }
     if (metadataWriteTimer) { clearTimeout(metadataWriteTimer); metadataWriteTimer = null; }
     cachedSettings = undefined;
@@ -1556,6 +1576,7 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
 
   // Inject thinking_budget_tokens for llama-cpp reasoning models
   pi.on("before_provider_request", (event, ctx) => {
+    if (!isLlamaStatusEnabled()) return;
     const provider = (ctx.model as any)?.provider;
     if (!PROVIDER_IDS.includes(provider || "")) return;
     if (!(ctx.model as any)?.reasoning) return;
@@ -1573,6 +1594,7 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
   // /props metadata after first successful provider response
   // (model is guaranteed loaded by this point — no race with model loading)
   pi.on("after_provider_response", (event, ctx) => {
+    if (!isLlamaStatusEnabled()) return;
     if (event.status !== 200) return;
     const provider = (ctx.model as any)?.provider;
     if (!PROVIDER_IDS.includes(provider || "")) return;
@@ -1588,10 +1610,23 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
   pi.registerCommand("llama-link", {
     description: "Toggle llama-link extension on/off",
     handler: async (_args, ctx) => {
-      const settings = loadSettings();
+      // Re-read fresh from disk to avoid clobbering external edits
+      const settingsPath = join(process.env.HOME || ".", ".pi", "agent", "settings.json");
+      let settings: Record<string, any> = {};
+      if (existsSync(settingsPath)) {
+        try { settings = JSON.parse(readFileSync(settingsPath, "utf-8")); } catch {}
+      }
       settings[SETTING_KEY] = !settings[SETTING_KEY];
+      // Sync cache if loaded
+      if (cachedSettings !== undefined) {
+        cachedSettings[SETTING_KEY] = settings[SETTING_KEY];
+      }
       mkdirSync(join(process.env.HOME || ".", ".pi", "agent"), { recursive: true });
-      writeFileSync(join(process.env.HOME || ".", ".pi", "agent", "settings.json"), JSON.stringify(settings, null, 2) + "\n");
+      writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+      if (!settings[SETTING_KEY]) {
+        stopSse();
+        ctx.ui.setStatus("llama", undefined);
+      }
       ctx.ui.notify(settings[SETTING_KEY] ? "Llama link enabled" : "Llama link disabled", settings[SETTING_KEY] ? "info" : "warning");
     },
   });
