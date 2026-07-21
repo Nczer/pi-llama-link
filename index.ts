@@ -158,15 +158,18 @@ const CHAT_TEMPLATE_THINKING_LEVEL_MAP = {
   max: "max",
 } satisfies NonNullable<ProviderModelConfig["thinkingLevelMap"]>;
 
-// Apply Qwen-style thinking (enable_thinking boolean toggle).
-function applyQwenThinkingSupport(model: Record<string, any>): void {
+// Apply enable_thinking thinking (boolean toggle via chat_template_kwargs).
+// Generic Jinja variable — works for Qwen, Gemma4, or any template that reads enable_thinking.
+function applyEnableThinkingSupport(model: Record<string, any>): void {
   model.reasoning = true;
   model.thinkingLevelMap = QWEN_THINKING_LEVEL_MAP;
   model.compat = {
     ...model.compat,
-    // Despite the Pi enum name, this sends llama.cpp's generic
-    // chat_template_kwargs.enable_thinking payload, not a Qwen-only option.
-    thinkingFormat: "qwen-chat-template",
+    thinkingFormat: "chat-template",
+    chatTemplateKwargs: {
+      "enable_thinking": { "$var": "thinking.enabled" },
+      "preserve_thinking": true,
+    },
   };
 }
 
@@ -1384,8 +1387,8 @@ function applyMetadataOverlay(model: ProviderModelConfig, serverId: string, over
     if (entry.thinking === "chat-template") {
       applyChatTemplateThinkingSupport(model as Record<string, any>);
     } else {
-      // Legacy boolean or "qwen-chat-template" → Qwen-style
-      applyQwenThinkingSupport(model as Record<string, any>);
+      // enable_thinking boolean toggle (Qwen, Gemma4, etc.)
+      applyEnableThinkingSupport(model as Record<string, any>);
     }
   }
   if (entry.contextWindow) {
