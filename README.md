@@ -62,8 +62,8 @@ On `session_start`, syncs model metadata to `~/.pi/agent/models.json`.
 
 Autodetects thinking capability from each model's chat template via `/props`:
 
-- **Qwen-style** (`enable_thinking` variable) → boolean toggle, `thinkingFormat: "qwen-chat-template"`. Only off/medium exposed.
-- **DeepSeek-style** (`thinking` variable) → effort string via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Full level mapping (off/minimal/low/medium/high/xhigh).
+- **enable_thinking style** (Qwen, Gemma4, etc.) → boolean toggle via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Only off/medium exposed.
+- **thinking variable style** (DeepSeek, etc.) → effort string via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Full level mapping (off/minimal/low/medium/high/xhigh).
 
 Discovered metadata is persisted to `llama-metadata.json` and applied on every model sync.
 
