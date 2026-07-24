@@ -1120,7 +1120,7 @@ async function syncToModelsJson(
           (mod) => mod === "text" || mod === "image",
         ),
         contextWindow,
-        maxTokens: Math.min(32000, contextWindow),
+        maxTokens: contextWindow,
         reasoning: false,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       };
@@ -1551,7 +1551,7 @@ function applyMetadataOverlay(model: ProviderModelConfig, serverId: string, over
   }
   if (entry.contextWindow) {
     model.contextWindow = entry.contextWindow;
-    model.maxTokens = Math.min(32000, entry.contextWindow);
+    model.maxTokens = entry.contextWindow;
   }
 }
 
