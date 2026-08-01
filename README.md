@@ -2,6 +2,8 @@
 
 Llama.cpp server integration link, model load/unload, and `models.json` sync for Pi.
 
+Requires Pi ≥ 0.80.6 (uses the `max` thinking tier).
+
 ## Commands
 
 | Command | Description |
@@ -25,7 +27,7 @@ One local server always present. Remote server is opt-in.
 
 ### URL Resolution (local server)
 
-Priority order: `.pi/llama-server.json` → `LLAMA_SERVER_URL` env → `settings.json` (`llamaServerUrl`) → `127.0.0.1:8080`.
+Priority order: `LLAMA_SERVER_URL` env → `settings.json` (`llamaServerUrl`) → `127.0.0.1:8080`.
 
 ### URL Resolution (remote server)
 
@@ -65,6 +67,8 @@ Autodetects thinking capability from each model's chat template via `/props`:
 - **enable_thinking style** (Qwen, Gemma4, etc.) → boolean toggle via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Only off/medium exposed.
 - **thinking variable style** (DeepSeek, etc.) → effort string via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Full level mapping (off/minimal/low/medium/high/xhigh).
 
+`thinking_budget_tokens` is injected for a subset of levels (`low` → 512, `high` → 8192); `medium` is intentionally unmapped and falls back to the server's default budget.
+
 Discovered metadata is persisted to `llama-metadata.json` and applied on every model sync.
 
 ## Architecture
@@ -94,7 +98,7 @@ The `/llama-model` overlay shows per-server:
 
 - **Emoji width**: use `visibleWidth()` from `@earendil-works/pi-tui`, not `.length`. Emojis (🟢⚪⬛📊▶) are 2 terminal columns. Using `.length` causes border overflow/glitch.
 - **Overlay**: `render(width)` must use the `width` param from Pi for the border. Fixed widths cause clipping on narrow terminals.
-- **Overlay options**: use `width: "80%"`, `maxWidth`, `maxHeight: "90%"` for responsive sizing.
+- **Overlay options**: use `width: "80%"`, `minWidth: 70`, `maxHeight: "90%"` for responsive sizing.
 - **Router mode**: `/props` returns router-level info only. Status and context size come from `/models` `status.args`. Slots/metrics need `?model=X` query param.
 - **Metrics requires `--metrics`**: `/metrics` returns 501 if server started without `--metrics` flag. Gracefully degrades (shows nothing).
 - **Slots may be disabled**: `/slots` can be disabled with `--no-slots`. Gracefully degrades.

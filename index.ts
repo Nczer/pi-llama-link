@@ -6,7 +6,7 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 const PROVIDER_NAME = "Llama.cpp";
@@ -125,6 +125,8 @@ interface ModelsJson {
 // Injected as thinking_budget_tokens in the request body for llama-cpp providers.
 // off: no budget injection (thinking disabled)
 // max: unrestricted (server default -1, no budget injection)
+// Only a few tiers are mapped on purpose; unmapped levels (e.g. medium)
+// intentionally fall back to the server's default budget (no injection).
 const THINKING_BUDGET_MAP: Record<string, number | undefined> = {
   off: undefined,
   low: 512,
@@ -448,37 +450,20 @@ async function watchModelEvents(
     });
     if (!response.ok || !response.body) return { loaded: false };
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop() || "";
-
-      for (const part of parts) {
-        for (const line of part.split("\n")) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("data:")) continue;
-          try {
-            const event = JSON.parse(trimmed.slice(5).trim());
-            if (event.model !== modelId) continue;
-            if (event.event === "model_status" || event.event === "status_change") {
-              const status = event.data?.status;
-              if (status === "loaded") return { loaded: true };
-              if (status === "unloaded") return { loaded: false, error: "Model failed to load" };
-              if (onProgress) {
-                const progress = parseLoadProgress(event.data);
-                if (progress) onProgress(progress);
-              }
-            }
-          } catch { /* skip malformed events */ }
+    for await (const jsonStr of parseSseStream(response)) {
+      try {
+        const event = JSON.parse(jsonStr);
+        if (event.model !== modelId) continue;
+        if (event.event === "model_status" || event.event === "status_change") {
+          const status = event.data?.status;
+          if (status === "loaded") return { loaded: true };
+          if (status === "unloaded") return { loaded: false, error: "Model failed to load" };
+          if (onProgress) {
+            const progress = parseLoadProgress(event.data);
+            if (progress) onProgress(progress);
+          }
         }
-      }
+      } catch { /* skip malformed events */ }
     }
     return { loaded: false };
   } catch {
@@ -504,12 +489,26 @@ async function loadModelAndWait(
     await loadModel(server, modelId);
     ctx.ui.setStatus("llama", "· Loading model...");
 
-    // Poll until loaded, with SSE events providing early hints
+    // Poll until loaded, with SSE events providing early hints.
+    // Transient failures (503 while the server is busy, network blips) are
+    // tolerated — the model keeps loading server-side, so we keep polling.
+    let transientFailures = 0;
     while (true) {
       if (signal?.aborted) throw signal.reason ?? new Error("Cancelled");
 
-      const models = await rpc<ModelsResponse>(server, "/models");
-      const entry = models.data.find((m) => m.id === modelId);
+      let entry: ModelsDataProperty | undefined;
+      try {
+        const models = await rpc<ModelsResponse>(server, "/models");
+        entry = models.data.find((m) => m.id === modelId);
+      } catch {
+        if (++transientFailures >= 20) {
+          // ~5s of consecutive failures — server is gone, not busy
+          throw new Error("Server unreachable while waiting for model to load");
+        }
+        await sleep(250, combinedSignal);
+        continue;
+      }
+      transientFailures = 0;
 
       if (entry?.status?.value === "loaded" || entry?.status?.value === "sleeping") return;
       if (entry?.status?.value === "unloaded" && entry?.status?.failed) {
@@ -1035,11 +1034,19 @@ async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Pro
     return;
   }
 
+  // Disambiguate duplicate display names (aliases) so each option maps 1:1
+  // to a model — indexOf(choice) then finds the right entry.
+  const nameCounts = new Map<string, number>();
+  for (const m of models) {
+    const name = m.aliases?.[0] || m.id;
+    nameCounts.set(name, (nameCounts.get(name) || 0) + 1);
+  }
   const options = models.map((m) => {
     const name = m.aliases?.[0] || m.id;
     const status = m.status?.value || "unknown";
     const icon = STATUS_ICONS[status] || "⚪";
-    return `${icon} ${name}`;
+    const label = (nameCounts.get(name) || 0) > 1 ? `${name} (${m.id})` : name;
+    return `${icon} ${label}`;
   });
 
   const choice = await ctx.ui.select(`Load model on ${server.name}:`, options);
@@ -1073,6 +1080,13 @@ function loadModelsJson(): ModelsJson {
     try { return JSON.parse(readFileSync(MODELS_JSON, "utf-8")); } catch {}
   }
   return { providers: {} };
+}
+
+/** Write via temp file + rename so a crash can't leave a half-written JSON */
+function atomicWrite(path: string, content: string): void {
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, content);
+  renameSync(tmp, path);
 }
 
 function modelsChanged(
@@ -1159,7 +1173,7 @@ async function syncToModelsJson(
     if (modelsWriteTimer) clearTimeout(modelsWriteTimer);
     pendingModelsStr = JSON.stringify(config, null, 2) + "\n";
     modelsWriteTimer = setTimeout(() => {
-      if (pendingModelsStr) writeFileSync(MODELS_JSON, pendingModelsStr);
+      if (pendingModelsStr) atomicWrite(MODELS_JSON, pendingModelsStr);
       modelsWriteTimer = null;
       pendingModelsStr = null;
       // Show status notification after write completes
@@ -1494,7 +1508,7 @@ function saveMetadataOverlay(metadata: ModelMetadata): void {
   if (metadataWriteTimer) clearTimeout(metadataWriteTimer);
   pendingMetadataStr = JSON.stringify(metadata, null, 2) + "\n";
   metadataWriteTimer = setTimeout(() => {
-    if (pendingMetadataStr) writeFileSync(METADATA_JSON, pendingMetadataStr);
+    if (pendingMetadataStr) atomicWrite(METADATA_JSON, pendingMetadataStr);
     metadataWriteTimer = null;
     pendingMetadataStr = null;
   }, 1000);
@@ -1587,6 +1601,7 @@ async function discoverModelMetadata(
     });
 
     if (!response.ok) {
+      discoveredMetadata.add(key); // don't retry + notify on every response
       u((c) => c.ui.notify(`[llama-cpp] /props for ${modelId} returned ${response.status}`, "error"));
       return;
     }
@@ -1623,7 +1638,8 @@ async function discoverModelMetadata(
   } catch (error) {
     const err = error as Error;
     const msg = err.name === "AbortError" ? "timeout" : err.message;
-    u((c) => c.ui.setStatus(serverId, undefined));
+    discoveredMetadata.add(key); // don't retry + notify on every response
+    u((c) => c.ui.setStatus("llama", undefined));
     u((c) => c.ui.notify(`[llama-cpp] /props for ${modelId} failed: ${msg}`, "error"));
   } finally {
     clearTimeout(timer);
@@ -1701,8 +1717,8 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     stopSse();
     sseCtx = null;
     // Flush pending debounced writes before clearing
-    if (pendingModelsStr) { writeFileSync(MODELS_JSON, pendingModelsStr); pendingModelsStr = null; }
-    if (pendingMetadataStr) { writeFileSync(METADATA_JSON, pendingMetadataStr); pendingMetadataStr = null; }
+    if (pendingModelsStr) { atomicWrite(MODELS_JSON, pendingModelsStr); pendingModelsStr = null; }
+    if (pendingMetadataStr) { atomicWrite(METADATA_JSON, pendingMetadataStr); pendingMetadataStr = null; }
     if (modelsWriteTimer) { clearTimeout(modelsWriteTimer); modelsWriteTimer = null; }
     if (metadataWriteTimer) { clearTimeout(metadataWriteTimer); metadataWriteTimer = null; }
     cachedSettings = undefined;
@@ -1759,12 +1775,14 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
   pi.on("after_provider_response", (event, ctx) => {
     if (!isLlamaStatusEnabled()) return;
     if (event.status !== 200) return;
-    const provider = (ctx.model as any)?.provider;
+    const model = ctx.model;
+    if (!model) return;
+    const provider = (model as any)?.provider;
     if (!PROVIDER_IDS.includes(provider || "")) return;
     void discoverModelMetadata(
       pi,
       provider,
-      ctx.model!.id,
+      model.id,
       ctx,
       PROPS_TIMEOUT_MS,
     );
@@ -1785,7 +1803,7 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
         cachedSettings[SETTING_KEY] = settings[SETTING_KEY];
       }
       mkdirSync(join(process.env.HOME || ".", ".pi", "agent"), { recursive: true });
-      writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+      atomicWrite(settingsPath, JSON.stringify(settings, null, 2) + "\n");
       if (!settings[SETTING_KEY]) {
         stopSse();
         ctx.ui.setStatus("llama", undefined);
