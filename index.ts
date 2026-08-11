@@ -160,6 +160,18 @@ const CHAT_TEMPLATE_THINKING_LEVEL_MAP = {
   max: "max",
 } satisfies NonNullable<ProviderModelConfig["thinkingLevelMap"]>;
 
+// Muse Glimmer style: chat_template_kwargs.reasoning_strength (effort string).
+// Reasoning channel is always on; only strength is controlled.
+const MUSE_THINKING_LEVEL_MAP = {
+  off: null,
+  minimal: null,
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  max: null,
+} satisfies NonNullable<ProviderModelConfig["thinkingLevelMap"]>;
+
 // Apply enable_thinking thinking (boolean toggle via chat_template_kwargs).
 // Generic Jinja variable — works for Qwen, Gemma4, or any template that reads enable_thinking.
 function applyEnableThinkingSupport(model: Record<string, any>): void {
@@ -184,6 +196,19 @@ function applyChatTemplateThinkingSupport(model: Record<string, any>): void {
     thinkingFormat: "chat-template",
     chatTemplateKwargs: {
       "thinking": { "$var": "thinking.effort", omitWhenOff: true },
+    },
+  };
+}
+
+// Apply Muse Glimmer thinking support (reasoning_strength effort string).
+function applyMuseThinkingSupport(model: Record<string, any>): void {
+  model.reasoning = true;
+  model.thinkingLevelMap = MUSE_THINKING_LEVEL_MAP;
+  model.compat = {
+    ...model.compat,
+    thinkingFormat: "chat-template",
+    chatTemplateKwargs: {
+      "reasoning_strength": { "$var": "thinking.effort" },
     },
   };
 }
@@ -1558,6 +1583,8 @@ function applyMetadataOverlay(model: ProviderModelConfig, serverId: string, over
   if (entry.thinking) {
     if (entry.thinking === "chat-template") {
       applyChatTemplateThinkingSupport(model as Record<string, any>);
+    } else if (entry.thinking === "muse-reasoning-strength") {
+      applyMuseThinkingSupport(model as Record<string, any>);
     } else {
       // enable_thinking boolean toggle (Qwen, Gemma4, etc.)
       applyEnableThinkingSupport(model as Record<string, any>);
@@ -1612,6 +1639,9 @@ async function discoverModelMetadata(
 
     if (data?.chat_template?.includes("enable_thinking") === true) {
       metadata.thinking = true; // Qwen-style boolean toggle
+      updated = true;
+    } else if (data?.chat_template?.includes("reasoning_strength")) {
+      metadata.thinking = "muse-reasoning-strength";
       updated = true;
     } else if (/\{[%{]\s*thinking\b/.test(data?.chat_template || "")) {
       // DeepSeek-style: chat_template_kwargs.thinking (effort string)
@@ -1759,6 +1789,10 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     const provider = (ctx.model as any)?.provider;
     if (!PROVIDER_IDS.includes(provider || "")) return;
     if (!(ctx.model as any)?.reasoning) return;
+
+    // Muse uses reasoning_strength template variable, not thinking_budget_tokens
+    const compat = (ctx.model as any)?.compat;
+    if (compat?.chatTemplateKwargs?.reasoning_strength) return;
 
     const level = pi.getThinkingLevel();
     const budget = THINKING_BUDGET_MAP[level];
