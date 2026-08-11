@@ -64,8 +64,9 @@ On `session_start`, syncs model metadata to `~/.pi/agent/models.json`.
 
 Autodetects thinking capability from each model's chat template via `/props`:
 
-- **enable_thinking style** (Qwen, Gemma4, etc.) → boolean toggle via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Only off/medium exposed.
-- **thinking variable style** (DeepSeek, etc.) → effort string via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Full level mapping (off/minimal/low/medium/high/xhigh).
+- **enable_thinking style** (Qwen, Gemma4, etc.) → boolean toggle via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Levels off/low/high/max exposed; budget tokens differentiate low vs high.
+- **thinking variable style** (DeepSeek, etc.) → effort string via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Full level mapping off/minimal/low/medium/high/xhigh/max.
+- **reasoning_strength style** (Muse Glimmer, etc.) → effort string via `chatTemplateKwargs.reasoning_strength`, `thinkingFormat: "chat-template"`. Reasoning channel is always on; levels low/medium/high/xhigh exposed, off/minimal/max hidden.
 
 `thinking_budget_tokens` is injected for a subset of levels (`low` → 512, `high` → 8192); `medium` is intentionally unmapped and falls back to the server's default budget.
 
