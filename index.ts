@@ -63,14 +63,9 @@ interface PropsResponse {
     n_ctx: number;
     params?: Record<string, any>;
   };
-  total_slots?: number;
-  model_path?: string;
-  modalities?: { vision: boolean };
-  build_info?: string;
 }
 
 interface SlotInfo {
-  id: number;
   is_processing: boolean;
   n_ctx: number;
   next_token?: {
@@ -78,19 +73,11 @@ interface SlotInfo {
     n_decoded: number;
     n_remain: number;
   };
-  params?: {
-    temperature?: number;
-    top_p?: number;
-    n_predict?: number;
-    samplers?: string[];
-  };
 }
 
 interface MetricsData {
   kv_cache_usage_ratio: number | null;
   kv_cache_tokens: number | null;
-  prompt_tokens_total: number | null;
-  predicted_tokens_total: number | null;
   prompt_tokens_per_second: number | null;
   predicted_tokens_per_second: number | null;
   requests_processing: number | null;
@@ -98,10 +85,8 @@ interface MetricsData {
 }
 
 interface V1ModelMeta {
-  vocab_type?: number;
   n_vocab?: number;
   n_ctx_train?: number;
-  n_embd?: number;
   n_params?: number;
   size?: number;
 }
@@ -349,8 +334,6 @@ function parsePrometheusMetrics(text: string): MetricsData {
   const metrics: MetricsData = {
     kv_cache_usage_ratio: null,
     kv_cache_tokens: null,
-    prompt_tokens_total: null,
-    predicted_tokens_total: null,
     prompt_tokens_per_second: null,
     predicted_tokens_per_second: null,
     requests_processing: null,
@@ -360,8 +343,6 @@ function parsePrometheusMetrics(text: string): MetricsData {
   const map: Record<string, keyof MetricsData> = {
     "llamacpp:kv_cache_usage_ratio": "kv_cache_usage_ratio",
     "llamacpp:kv_cache_tokens": "kv_cache_tokens",
-    "llamacpp:prompt_tokens_total": "prompt_tokens_total",
-    "llamacpp:tokens_predicted_total": "predicted_tokens_total",
     "llamacpp:prompt_tokens_seconds": "prompt_tokens_per_second",
     "llamacpp:predicted_tokens_seconds": "predicted_tokens_per_second",
     "llamacpp:requests_processing": "requests_processing",
@@ -400,7 +381,6 @@ async function fetchMetrics(server: ServerConfig, modelId?: string): Promise<Met
   } catch {
     return {
       kv_cache_usage_ratio: null, kv_cache_tokens: null,
-      prompt_tokens_total: null, predicted_tokens_total: null,
       prompt_tokens_per_second: null, predicted_tokens_per_second: null,
       requests_processing: null, requests_deferred: null,
     };
@@ -453,17 +433,12 @@ function parseLoadProgress(data: unknown): LoadProgress | undefined {
   };
 }
 
-interface WatchResult {
-  loaded: boolean;
-  error?: string;
-}
-
 async function watchModelEvents(
   server: ServerConfig,
   modelId: string,
   signal: AbortSignal,
   onProgress?: (progress: LoadProgress) => void,
-): Promise<WatchResult> {
+): Promise<void> {
   const apiKey = resolveApiKey(server.id);
   try {
     const response = await fetch(`${server.url}/models/sse`, {
@@ -473,7 +448,7 @@ async function watchModelEvents(
       },
       signal,
     });
-    if (!response.ok || !response.body) return { loaded: false };
+    if (!response.ok || !response.body) return;
 
     for await (const jsonStr of parseSseStream(response)) {
       try {
@@ -481,8 +456,8 @@ async function watchModelEvents(
         if (event.model !== modelId) continue;
         if (event.event === "model_status" || event.event === "status_change") {
           const status = event.data?.status;
-          if (status === "loaded") return { loaded: true };
-          if (status === "unloaded") return { loaded: false, error: "Model failed to load" };
+          // Stop watching once settled — the poller is the source of truth
+          if (status === "loaded" || status === "unloaded") return;
           if (onProgress) {
             const progress = parseLoadProgress(event.data);
             if (progress) onProgress(progress);
@@ -490,9 +465,8 @@ async function watchModelEvents(
         }
       } catch { /* skip malformed events */ }
     }
-    return { loaded: false };
   } catch {
-    return { loaded: false }; // SSE not available — will rely on polling
+    // SSE not available — will rely on polling
   }
 }
 
@@ -500,18 +474,26 @@ async function loadModelAndWait(
   server: ServerConfig,
   modelId: string,
   ctx: ExtensionCommandContext,
-  signal?: AbortSignal,
 ): Promise<void> {
+  // Accept aliases: SSE events and /models polling report the real id, so
+  // resolve to it first (fall back to the given id if the server is down).
+  let targetId = modelId;
+  try {
+    const res = await rpc<ModelsResponse>(server, "/models");
+    const entry = (res.data || []).find((m) => matchModel(m, modelId));
+    if (entry) targetId = entry.id;
+  } catch {}
+
   const watcher = new AbortController();
-  const combinedSignal = signal ? AbortSignal.any([signal, watcher.signal]) : watcher.signal;
+  const combinedSignal = watcher.signal;
 
   // Start SSE watcher in background for instant load detection
-  const watchPromise = watchModelEvents(server, modelId, combinedSignal, (progress) => {
+  const watchPromise = watchModelEvents(server, targetId, combinedSignal, (progress) => {
     ctx.ui.setStatus("llama", `· ${progress.message}${progress.ratio !== undefined ? ` ${Math.round(progress.ratio * 100)}%` : ""}`);
   });
 
   try {
-    await loadModel(server, modelId);
+    await loadModel(server, targetId);
     ctx.ui.setStatus("llama", "· Loading model...");
 
     // Poll until loaded, with SSE events providing early hints.
@@ -519,12 +501,10 @@ async function loadModelAndWait(
     // tolerated — the model keeps loading server-side, so we keep polling.
     let transientFailures = 0;
     while (true) {
-      if (signal?.aborted) throw signal.reason ?? new Error("Cancelled");
-
       let entry: ModelsDataProperty | undefined;
       try {
         const models = await rpc<ModelsResponse>(server, "/models");
-        entry = models.data.find((m) => m.id === modelId);
+        entry = models.data.find((m) => m.id === targetId);
       } catch {
         if (++transientFailures >= 20) {
           // ~5s of consecutive failures — server is gone, not busy
@@ -634,15 +614,15 @@ class ModelInspector {
     );
   }
 
-  async loadedModels(): Promise<Array<{ id: string; name: string; status: string }>> {
+  async loadedModels(): Promise<Array<{ id: string; name: string; aliases?: string[]; status: string }>> {
     const data = await this.fetchData();
     // Router mode: status is in /models data
     if (this.getMode() === "router") {
-      const loaded: Array<{ id: string; name: string; status: string }> = [];
+      const loaded: Array<{ id: string; name: string; aliases?: string[]; status: string }> = [];
       for (const model of data) {
         const value = model.status?.value;
         if (value === "loaded" || value === "sleeping") {
-          loaded.push({ id: model.id, name: model.aliases?.[0] || model.id, status: value });
+          loaded.push({ id: model.id, name: model.aliases?.[0] || model.id, aliases: model.aliases, status: value });
         }
       }
       return loaded;
@@ -652,11 +632,11 @@ class ModelInspector {
     if (data.length === 0) return [];
     if (props.is_sleeping) {
       const model = data[0];
-      return [{ id: model.id, name: model.aliases?.[0] || model.id, status: "sleeping" }];
+      return [{ id: model.id, name: model.aliases?.[0] || model.id, aliases: model.aliases, status: "sleeping" }];
     }
     if (!props.error) {
       const model = data[0];
-      return [{ id: model.id, name: model.aliases?.[0] || model.id, status: "loaded" }];
+      return [{ id: model.id, name: model.aliases?.[0] || model.id, aliases: model.aliases, status: "loaded" }];
     }
     return [];
   }
@@ -743,6 +723,30 @@ function resolveContextSize(m: ModelsDataProperty): number {
 
 function findServerByProvider(provider: string, servers: ServerConfig[]): ServerConfig | undefined {
   return servers.find((s) => s.id === provider);
+}
+
+/**
+ * Map each server model's real id to the id used in models.json:
+ * the first alias when present and not claimed by another model,
+ * otherwise the real id. llama.cpp resolves aliases on all endpoints
+ * (chat completions, /props, /slots, /models/load|unload), and Pi
+ * displays and requests by id — so an alias id shows the short name
+ * and is directly usable as the request model.
+ */
+function resolveApiIds(models: ModelsDataProperty[]): Map<string, string> {
+  const taken = new Set(models.map((m) => m.id)); // real ids are always reserved
+  const result = new Map<string, string>();
+  for (const m of models) {
+    const alias = m.aliases?.[0];
+    const apiId = alias && !taken.has(alias) ? alias : m.id;
+    if (apiId !== m.id) taken.add(apiId);
+    result.set(m.id, apiId);
+  }
+  return result;
+}
+
+function matchModel(m: { id: string; aliases?: string[] }, piModelId: string): boolean {
+  return m.id === piModelId || (m.aliases?.includes(piModelId) ?? false);
 }
 
 // ── Server Gathering ──────────────────────────────────────────────────
@@ -850,12 +854,14 @@ async function buildStatusLines(current: ProviderModelConfig | undefined): Promi
     const inspector = new ModelInspector(server, models.length > 0 ? { data: models, mode: mode! } : undefined);
     const loadedModels = await inspector.loadedModels();
 
+    // Pi model ids may be aliases — match server models by id or alias
+    const isCurrent = (m: { id: string; aliases?: string[] }): boolean => {
+      if (!isLlamaModel || !current || currentProvider !== server.id) return false;
+      return matchModel(m, current.id);
+    };
+
     // Sort so the active Pi model comes first
-    loadedModels.sort((a, b) => {
-      const aActive = isLlamaModel && currentProvider === server.id && current.id === a.id ? 1 : 0;
-      const bActive = isLlamaModel && currentProvider === server.id && current.id === b.id ? 1 : 0;
-      return bActive - aActive;
-    });
+    loadedModels.sort((a, b) => Number(isCurrent(b)) - Number(isCurrent(a)));
 
     if (loadedModels.length === 0) {
       lines.push(`  ⚪ No model loaded`);
@@ -866,7 +872,7 @@ async function buildStatusLines(current: ProviderModelConfig | undefined): Promi
       const icon = STATUS_ICONS[status] || "⚪";
       const contextSize = inspector.contextSize(id);
       const caps = inspector.capabilities(id);
-      const isActive = isLlamaModel && currentProvider === server.id && current.id === id;
+      const isActive = isCurrent(serverModel);
       const isSleeping = status === "sleeping";
 
       lines.push(`  ${icon} ${name} (${status})${isActive ? " ✓ active" : ""}`);
@@ -875,10 +881,11 @@ async function buildStatusLines(current: ProviderModelConfig | undefined): Promi
       // Skip live endpoints for sleeping models — they wake the model on the router
       if (!isSleeping) {
         // Fetch slots, metrics, v1 metadata in parallel
-        const [meta, slots, metrics] = await Promise.all([
+        const [meta, metrics] = await Promise.all([
           inspector.getModelMeta(id),
-          inspector.getSlots(mode === "router" ? id : undefined),
           inspector.getMetrics(mode === "router" ? id : undefined),
+          // Warm the slots cache so the sync getSlotInfo below can read it
+          inspector.getSlots(mode === "router" ? id : undefined),
         ]);
 
         // Model metadata
@@ -918,7 +925,7 @@ async function buildStatusLines(current: ProviderModelConfig | undefined): Promi
         const status = await inspector.status(m.id);
         const icon = STATUS_ICONS[status] || "⚪";
         const name = m.aliases?.[0] || m.id;
-        const active = isLlamaModel && currentProvider === server.id && current.id === m.id ? " ← active" : "";
+        const active = isCurrent(m) ? " ← active" : "";
         lines.push(`    ${icon} ${name}${active}`);
       }
     }
@@ -931,7 +938,7 @@ async function showStatus(ctx: ExtensionCommandContext): Promise<void> {
   const contentLines = await buildStatusLines(ctx.model);
 
   await ctx.ui.custom<void>(
-    (tui, theme, _keybindings, done) => {
+    (_tui, theme, _keybindings, done) => {
       return {
         handleInput(data: string) {
           if (matchesKey(data, "escape") || matchesKey(data, "q")) {
@@ -958,7 +965,6 @@ async function showStatus(ctx: ExtensionCommandContext): Promise<void> {
       overlayOptions: {
         anchor: "center",
         width: "80%",
-        // maxWidth: OVERLAY_WIDTH,
         minWidth: OVERLAY_WIDTH,
         maxHeight: "90%",
       },
@@ -996,7 +1002,8 @@ async function unloadModel(ctx: ExtensionCommandContext): Promise<void> {
   const inspector = new ModelInspector(server, { data: modelsRes.data || [], mode });
   const loadedModels = await inspector.loadedModels();
   // Prefer the current Pi model; fall back to first loaded
-  const serverModel = loadedModels.find((m) => m.id === current.id) || loadedModels[0];
+  // (current.id may be an alias, loaded models carry real ids + aliases)
+  const serverModel = loadedModels.find((m) => matchModel(m, current.id)) || loadedModels[0];
 
   if (!serverModel) {
     ctx.ui.notify(`${server.name}: no model loaded`, "info");
@@ -1020,10 +1027,8 @@ async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Pro
     ? findServerByProvider(modelProvider, servers) || servers[0]
     : servers[0];
 
-  let ready = false;
   try {
     await rpc<ModelsResponse>(server, "/models");
-    ready = true;
   } catch {
     ctx.ui.notify(`${server.name} unreachable`, "error");
     return;
@@ -1116,16 +1121,17 @@ function atomicWrite(path: string, content: string): void {
 
 function modelsChanged(
   existing: any[],
-  incoming: Array<{ id: string; name: string; contextWindow: number; input: string[]; reasoning?: boolean }>,
+  incoming: Array<{ id: string; contextWindow: number; input: string[]; reasoning?: boolean }>,
 ): boolean {
   if (existing.length !== incoming.length) return true;
   const existingMap = new Map(existing.map((m: any) => [m.id, m]));
   for (const m of incoming) {
     const match = existingMap.get(m.id);
     if (!match) return true;
+    // Legacy entries carried a redundant name field — strip it on rewrite
+    if (match.name !== undefined) return true;
     if (match.contextWindow !== m.contextWindow) return true;
     if (Boolean(m.reasoning) !== Boolean(match.reasoning)) return true;
-    if (match.name !== m.name) return true;
     if ((match.input || []).join(",") !== m.input.join(",")) return true;
   }
   return false;
@@ -1139,6 +1145,8 @@ async function syncToModelsJson(
 ): Promise<boolean> {
   const serverInfo = await gatherServers();
   const config = loadModelsJson();
+  const overlay = loadMetadataOverlay();
+  let overlayDirty = false;
   let wrote = false;
   const validModels = new Map<string, Set<string>>();
 
@@ -1147,14 +1155,17 @@ async function syncToModelsJson(
 
     // Filter out auto-exposed HF cache entries (undefined models)
     const filteredModels = models.filter((m) => !isAutoExposedCacheEntry(m));
-    validModels.set(server.id, new Set(filteredModels.map((m) => m.id)));
     if (filteredModels.length === 0) continue;
 
-    const modelConfigs: ProviderModelConfig[] = filteredModels.map(m => {
+    // Use each model's alias as its Pi id when available (llama.cpp accepts
+    // the alias in every request), falling back to the real id.
+    const apiIds = resolveApiIds(filteredModels);
+    validModels.set(server.id, new Set(apiIds.values()));
+
+    const modelConfigs: Array<Omit<ProviderModelConfig, "name">> = filteredModels.map(m => {
       const contextWindow = resolveContextSize(m);
       return {
-        id: m.id,
-        name: m.aliases?.[0] || m.id,
+        id: apiIds.get(m.id)!,
         input: (m.architecture?.input_modalities || ["text"]).filter(
           (mod) => mod === "text" || mod === "image",
         ),
@@ -1165,10 +1176,11 @@ async function syncToModelsJson(
       };
     });
 
-    const overlay = loadMetadataOverlay();
+    // Re-key persisted metadata from real ids to alias ids so overrides survive
+    if (migrateMetadataKeys(overlay, server.id, apiIds)) overlayDirty = true;
     const modelsWithOverlay = modelConfigs.map(m => {
-      const { id, name, input, contextWindow, maxTokens, cost } = m;
-      const result: any = { id, name, input, contextWindow, maxTokens, cost };
+      const { id, input, contextWindow, maxTokens, cost } = m;
+      const result: any = { id, input, contextWindow, maxTokens, cost };
       applyMetadataOverlay(result, server.id, overlay);
       return result;
     });
@@ -1213,8 +1225,10 @@ async function syncToModelsJson(
     }, 1000);
   }
 
+  if (overlayDirty) saveMetadataOverlay(overlay);
+
   // Prune metadata for removed/renamed models (only for reachable servers)
-  cleanupStaleMetadata(validModels, serverInfo.filter((s) => s.ready).map((s) => s.server.id));
+  cleanupStaleMetadata(overlay, validModels, serverInfo.filter((s) => s.ready).map((s) => s.server.id));
 
   return wrote;
 }
@@ -1228,7 +1242,6 @@ const pendingMetadata = new Set<string>();
 // ── SSE Model Loading Progress ────────────────────────────────────────
 
 interface SseProgress {
-  stages?: string[];   // ["text_model", "spec_model", "mmproj_model"]
   current?: string;    // "text_model", "spec_model", "mmproj_model"
   stage?: string;      // older format: single stage name
   value?: number;      // 0.0 — 1.0
@@ -1237,7 +1250,6 @@ interface SseProgress {
 interface ModelLoadState {
   status: string;      // "loading", "loaded", "sleeping", "unloaded"
   progress?: SseProgress;
-  modelId?: string;
 }
 
 // Active SSE connection state
@@ -1435,15 +1447,12 @@ function handleSseEvent(
   const inner = payload.data;
   if (!inner || !inner.status) return;
 
-  const modelId = payload.model;
   const status = inner.status;
   const progress = inner.progress;
 
-  // Track state per model
   const state: ModelLoadState = {
     status,
     progress: progress || undefined,
-    modelId,
   };
   // Update status bar if this model belongs to the active server
   if (serverId === sseServerId && sseCtx) {
@@ -1539,8 +1548,7 @@ function saveMetadataOverlay(metadata: ModelMetadata): void {
   }, 1000);
 }
 
-function cleanupStaleMetadata(validModels: Map<string, Set<string>>, reachableServers: string[]): void {
-  const overlay = loadMetadataOverlay();
+function cleanupStaleMetadata(overlay: ModelMetadata, validModels: Map<string, Set<string>>, reachableServers: string[]): void {
   let pruned = false;
   for (const serverId of Object.keys(overlay)) {
     // Skip servers that weren't reachable — don't delete their metadata
@@ -1568,6 +1576,28 @@ function cleanupStaleMetadata(validModels: Map<string, Set<string>>, reachableSe
   }
 }
 
+/**
+ * Re-key persisted metadata entries from real server ids to the alias ids
+ * used in models.json, so thinking/context overrides survive the id switch.
+ * Existing alias-keyed entries win over stale real-id entries.
+ */
+function migrateMetadataKeys(overlay: ModelMetadata, serverId: string, apiIds: Map<string, string>): boolean {
+  const srv = overlay[serverId];
+  if (!srv) return false;
+  let changed = false;
+  for (const [realId, apiId] of apiIds) {
+    if (realId === apiId || !srv[realId]) continue;
+    if (srv[apiId]) {
+      delete srv[realId];
+    } else {
+      srv[apiId] = srv[realId];
+      delete srv[realId];
+    }
+    changed = true;
+  }
+  return changed;
+}
+
 function persistModelMetadata(serverId: string, modelId: string, data: { thinking?: boolean | string; contextWindow?: number }): void {
   const overlay = loadMetadataOverlay();
   if (!overlay[serverId]) overlay[serverId] = {};
@@ -1576,18 +1606,18 @@ function persistModelMetadata(serverId: string, modelId: string, data: { thinkin
   saveMetadataOverlay(overlay);
 }
 
-function applyMetadataOverlay(model: ProviderModelConfig, serverId: string, overlay?: ModelMetadata): void {
+function applyMetadataOverlay(model: Record<string, any>, serverId: string, overlay?: ModelMetadata): void {
   const data = overlay ?? loadMetadataOverlay();
   const entry = data[serverId]?.[model.id];
   if (!entry) return;
   if (entry.thinking) {
     if (entry.thinking === "chat-template") {
-      applyChatTemplateThinkingSupport(model as Record<string, any>);
+      applyChatTemplateThinkingSupport(model);
     } else if (entry.thinking === "muse-reasoning-strength") {
-      applyMuseThinkingSupport(model as Record<string, any>);
+      applyMuseThinkingSupport(model);
     } else {
       // enable_thinking boolean toggle (Qwen, Gemma4, etc.)
-      applyEnableThinkingSupport(model as Record<string, any>);
+      applyEnableThinkingSupport(model);
     }
   }
   if (entry.contextWindow) {
@@ -1597,7 +1627,6 @@ function applyMetadataOverlay(model: ProviderModelConfig, serverId: string, over
 }
 
 async function discoverModelMetadata(
-  pi: ExtensionAPI,
   serverId: string,
   modelId: string,
   ctx?: ExtensionContext,
@@ -1814,7 +1843,6 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     const provider = (model as any)?.provider;
     if (!PROVIDER_IDS.includes(provider || "")) return;
     void discoverModelMetadata(
-      pi,
       provider,
       model.id,
       ctx,

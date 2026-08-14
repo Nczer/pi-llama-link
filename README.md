@@ -54,7 +54,9 @@ Connects to `/models/sse` to show real-time loading progress in the status bar:
 
 On `session_start`, syncs model metadata to `~/.pi/agent/models.json`.
 
-- `id`, `name`, `input` (capabilities), `contextWindow`, `maxTokens`
+- `id`, `input` (capabilities), `contextWindow`, `maxTokens` (no `name` field — Pi displays the id)
+- Model `id` uses the model's first alias when present (e.g. `Qwen3.8-27B` instead of `Qwen3.8-27B-Q4_K_XL`). llama.cpp resolves aliases on every endpoint (`/v1/chat/completions`, `/props`, `/slots`, `/models/load|unload`), so the alias is directly usable as the request model. Real ids are always reserved; on alias collision the first model wins.
+- Persisted metadata (`llama-metadata.json`) is re-keyed from old real ids to alias ids on sync, so thinking/context overrides survive
 - Skips write if model list and context windows are unchanged
 - Each server writes under its own provider key
 - Filters out auto-exposed HF cache entries (undefined models like `unsloth/Qwen3.6-27B-MTP-GGUF:Q4_K_XL`)
@@ -75,15 +77,14 @@ Discovered metadata is persisted to `llama-metadata.json` and applied on every m
 ## Architecture
 
 - `rpc(server, endpoint, body?)` — per-server HTTP client (all API calls go through this)
-- `isServerReady(server)` — `/health` check
 - `fetchSlots(server, modelId?)` — `GET /slots` (or `/slots?model=X` in router mode)
 - `fetchMetrics(server, modelId?)` — `GET /metrics` (Prometheus text format, parsed to MetricsData)
 - `fetchV1Models(server)` — `GET /v1/models` for rich metadata (n_params, n_vocab, size)
 - `loadModel(server, modelId)` — `POST /models/load` (router mode)
 - `detectMode(res)` — `models` field present → single, absent → router
-- `getModelStatus(server, id)` — router: from `/models` data; single: from `/props`. Returns `loaded|loading|sleeping|unloaded|failed`
-- `resolveContextSize(model)` — router: parses `--ctx-size` then `--fit-ctx` from `status.args`; single: `meta.n_ctx`. Fallback: 32768.
-- `buildStatusLines(cwd, current)` — gathers all data, returns plain string lines
+- `ModelInspector.status(id)` — router: from `/models` data; single: from `/props`. Returns `loaded|loading|sleeping|unloaded|failed`
+- `resolveContextSize(model)` — router: parses `--ctx-size`/`-c`/`-ctx`/`--fit-ctx` from `status.args`; single: `meta.n_ctx`, then `n_ctx_train`. Fallback: 32768.
+- `buildStatusLines(current)` — gathers all data, returns plain string lines
 - `buildBorderDynamic(theme, lines, width)` — wraps lines in box-drawing border using `visibleWidth()` for emoji-safe padding
 
 ## Status Display
@@ -107,6 +108,7 @@ The `/llama-model` overlay shows per-server:
 - **Remote is opt-in**: no default remote URL. Must be set explicitly in `settings.json`.
 - **Provider IDs**: both `llama-server` and `llama-cpp` are accepted for unload checks.
 - **Multi-server**: `rpc` takes a `ServerConfig`, not a global URL. All helpers are per-server.
-- **V1 models ID matching**: `/v1/models` may return full paths; match by checking if ID ends with the model id from `/models`.
+- **V1 models ID matching**: `/v1/models` reports real ids only (and may return full paths); match by checking if ID ends with the model id from `/models`.
+- **Aliases as Pi ids**: models.json uses each model's first alias as the id when present; `/llama-load <alias>`, status display, and `/llama-unload` all resolve aliases against the server's `/models` data.
 - **Metrics parsing**: Prometheus text format — skip `#` comments, split on last space for value.
 - **Load UI**: `/llama-load` with no args shows `ctx.ui.select` picker. With an arg, loads directly.
