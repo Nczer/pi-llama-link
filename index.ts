@@ -176,19 +176,20 @@ function applyChatTemplateThinkingSupport(model: Record<string, any>): void {
 }
 
 // Apply effort-style thinking support (reasoning_effort / reasoning_strength effort string).
-// Server binds one request value to both variable names; send both keys so any
-// naming works. Off → "none" (server disables reasoning), only when the template
+// Emit only the variable names the template actually references (parsed from the
+// template text); fall back to both names when detection was caps-only (no text).
+// Off → "none" (server disables reasoning), only when the template
 // gates on enable_thinking — otherwise off is hidden (channel has no off path).
 function applyEffortThinkingSupport(model: Record<string, any>, effort: EffortStyle): void {
   model.reasoning = true;
   model.thinkingLevelMap = buildEffortLevelMap(effort);
+  const effortVars = effort.varNames ?? ["reasoning_effort", "reasoning_strength"];
   model.compat = {
     ...model.compat,
     thinkingFormat: "chat-template",
     chatTemplateKwargs: {
       ...(effort.off ? { "enable_thinking": { "$var": "thinking.enabled" } } : {}),
-      "reasoning_effort": { "$var": "thinking.effort" },
-      "reasoning_strength": { "$var": "thinking.effort" },
+      ...Object.fromEntries(effortVars.map((name) => [name, { "$var": "thinking.effort" }])),
     },
   };
 }
@@ -1828,9 +1829,10 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     if (!PROVIDER_IDS.includes(provider || "")) return;
     if (!(ctx.model as any)?.reasoning) return;
 
-    // Muse uses reasoning_strength template variable, not thinking_budget_tokens
-    const compat = (ctx.model as any)?.compat;
-    if (compat?.chatTemplateKwargs?.reasoning_strength) return;
+    // Effort-style models (Muse/Qwen) consume reasoning_effort/reasoning_strength,
+    // not thinking_budget_tokens
+    const kwargs = (ctx.model as any)?.compat?.chatTemplateKwargs;
+    if (kwargs?.reasoning_effort || kwargs?.reasoning_strength) return;
 
     const level = pi.getThinkingLevel();
     const budget = THINKING_BUDGET_MAP[level];

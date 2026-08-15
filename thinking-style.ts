@@ -39,6 +39,12 @@ export interface EffortStyle {
   aliases?: Record<string, string>;
   /** Template gates on enable_thinking → "off" is expressible. */
   off: boolean;
+  /**
+   * Variable names the template actually references (subset of
+   * ["reasoning_effort", "reasoning_strength"]); undefined → unknown
+   * (caps-only detection, no template text) → send both.
+   */
+  varNames?: string[];
 }
 
 export interface ThinkingStyle {
@@ -90,10 +96,17 @@ export function parseEffortTemplate(ct: string): EffortStyle {
     }
   }
 
+  // Variable names the template actually reads — caps probes can't
+  // distinguish the two, but the template text can.
+  const varNames: string[] = [];
+  if (/reasoning_effort\b/.test(ct)) varNames.push("reasoning_effort");
+  if (/reasoning_strength\b/.test(ct)) varNames.push("reasoning_strength");
+
   return {
     levels,
     aliases: Object.keys(aliases).length > 0 ? aliases : undefined,
     off: /enable_thinking/.test(ct),
+    varNames: varNames.length > 0 ? varNames : undefined,
   };
 }
 
