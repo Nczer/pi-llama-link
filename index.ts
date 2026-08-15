@@ -6,6 +6,7 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
+import { classifyThinkingStyle, buildEffortLevelMap, type EffortStyle } from "./thinking-style";
 import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
@@ -145,17 +146,8 @@ const CHAT_TEMPLATE_THINKING_LEVEL_MAP = {
   max: "max",
 } satisfies NonNullable<ProviderModelConfig["thinkingLevelMap"]>;
 
-// Muse Glimmer style: chat_template_kwargs.reasoning_strength (effort string).
-// Reasoning channel is always on; only strength is controlled.
-const MUSE_THINKING_LEVEL_MAP = {
-  off: null,
-  minimal: null,
-  low: "low",
-  medium: "medium",
-  high: "high",
-  xhigh: "xhigh",
-  max: null,
-} satisfies NonNullable<ProviderModelConfig["thinkingLevelMap"]>;
+// Effort style (reasoning_effort / reasoning_strength): per-model level maps
+// and tier parsing live in thinking-style.ts, populated from /props discovery.
 
 // Apply enable_thinking thinking (boolean toggle via chat_template_kwargs).
 // Generic Jinja variable — works for Qwen, Gemma4, or any template that reads enable_thinking.
@@ -185,14 +177,19 @@ function applyChatTemplateThinkingSupport(model: Record<string, any>): void {
   };
 }
 
-// Apply Muse Glimmer thinking support (reasoning_strength effort string).
-function applyMuseThinkingSupport(model: Record<string, any>): void {
+// Apply effort-style thinking support (reasoning_effort / reasoning_strength effort string).
+// Server binds one request value to both variable names; send both keys so any
+// naming works. Off → "none" (server disables reasoning), only when the template
+// gates on enable_thinking — otherwise off is hidden (channel has no off path).
+function applyEffortThinkingSupport(model: Record<string, any>, effort: EffortStyle): void {
   model.reasoning = true;
-  model.thinkingLevelMap = MUSE_THINKING_LEVEL_MAP;
+  model.thinkingLevelMap = buildEffortLevelMap(effort);
   model.compat = {
     ...model.compat,
     thinkingFormat: "chat-template",
     chatTemplateKwargs: {
+      ...(effort.off ? { "enable_thinking": { "$var": "thinking.enabled" } } : {}),
+      "reasoning_effort": { "$var": "thinking.effort" },
       "reasoning_strength": { "$var": "thinking.effort" },
     },
   };
@@ -1525,10 +1522,16 @@ function isSseActive(): boolean {
 // ── Metadata Overlay ──────────────────────────────────────────────────
 // Persists model capabilities (thinking, context size) per server:model so it survives model syncs.
 
+interface ModelMetadataEntry {
+  thinking?: boolean | "effort" | "chat-template" | "toggle" | "muse-reasoning-strength";
+  effortLevels?: string[];
+  effortAliases?: Record<string, string>;
+  effortOff?: boolean;
+  contextWindow?: number;
+}
+
 interface ModelMetadata {
-  [serverId: string]: {
-    [modelId: string]: { thinking?: boolean | string; contextWindow?: number };
-  };
+  [serverId: string]: { [modelId: string]: ModelMetadataEntry };
 }
 
 function loadMetadataOverlay(): ModelMetadata {
@@ -1598,7 +1601,7 @@ function migrateMetadataKeys(overlay: ModelMetadata, serverId: string, apiIds: M
   return changed;
 }
 
-function persistModelMetadata(serverId: string, modelId: string, data: { thinking?: boolean | string; contextWindow?: number }): void {
+function persistModelMetadata(serverId: string, modelId: string, data: ModelMetadataEntry): void {
   const overlay = loadMetadataOverlay();
   if (!overlay[serverId]) overlay[serverId] = {};
   const existing = overlay[serverId][modelId] || {};
@@ -1611,13 +1614,24 @@ function applyMetadataOverlay(model: Record<string, any>, serverId: string, over
   const entry = data[serverId]?.[model.id];
   if (!entry) return;
   if (entry.thinking) {
-    if (entry.thinking === "chat-template") {
-      applyChatTemplateThinkingSupport(model);
-    } else if (entry.thinking === "muse-reasoning-strength") {
-      applyMuseThinkingSupport(model);
-    } else {
-      // enable_thinking boolean toggle (Qwen, Gemma4, etc.)
-      applyEnableThinkingSupport(model);
+    switch (entry.thinking) {
+      case "chat-template":
+        applyChatTemplateThinkingSupport(model);
+        break;
+      case "effort":
+        applyEffortThinkingSupport(model, {
+          levels: entry.effortLevels,
+          aliases: entry.effortAliases,
+          off: entry.effortOff === true,
+        });
+        break;
+      case "muse-reasoning-strength":
+        // Legacy (pre-effort-style): generic free-form tiers, no off path.
+        applyEffortThinkingSupport(model, { off: false });
+        break;
+      default:
+        // "toggle" or legacy true — enable_thinking boolean toggle (Qwen, Gemma4, etc.)
+        applyEnableThinkingSupport(model);
     }
   }
   if (entry.contextWindow) {
@@ -1664,18 +1678,18 @@ async function discoverModelMetadata(
 
     const data = await response.json();
     let updated = false;
-    const metadata: { thinking?: boolean | string; contextWindow?: number } = {};
+    const metadata: ModelMetadataEntry = {};
 
-    if (data?.chat_template?.includes("enable_thinking") === true) {
-      metadata.thinking = true; // Qwen-style boolean toggle
-      updated = true;
-    } else if (data?.chat_template?.includes("reasoning_strength")) {
-      metadata.thinking = "muse-reasoning-strength";
-      updated = true;
-    } else if (/\{[%{]\s*thinking\b/.test(data?.chat_template || "")) {
-      // DeepSeek-style: chat_template_kwargs.thinking (effort string)
-      // Matches {{ thinking }}, {% if thinking %}, {% set thinking = ..., etc.
-      metadata.thinking = "chat-template";
+    // Effort styles (reasoning_effort/reasoning_strength) are classified first:
+    // templates like Qwen3.8 have both enable_thinking and a tiered effort var.
+    const style = classifyThinkingStyle(data);
+    if (style.style !== "none") {
+      metadata.thinking = style.style;
+      if (style.style === "effort" && style.effort) {
+        if (style.effort.levels) metadata.effortLevels = style.effort.levels;
+        if (style.effort.aliases) metadata.effortAliases = style.effort.aliases;
+        metadata.effortOff = style.effort.off;
+      }
       updated = true;
     }
 

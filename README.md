@@ -64,15 +64,18 @@ On `session_start`, syncs model metadata to `~/.pi/agent/models.json`.
 
 ## Thinking Support
 
-Autodetects thinking capability from each model's chat template via `/props`:
+Autodetects thinking capability from each model's chat template via `/props` (`chat_template` + `chat_template_caps`), classified in `thinking-style.ts`:
 
-- **enable_thinking style** (Qwen, Gemma4, etc.) → boolean toggle via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Levels off/low/high/max exposed; budget tokens differentiate low vs high.
-- **thinking variable style** (DeepSeek, etc.) → effort string via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Full level mapping off/minimal/low/medium/high/xhigh/max.
-- **reasoning_strength style** (Muse Glimmer, etc.) → effort string via `chatTemplateKwargs.reasoning_strength`, `thinkingFormat: "chat-template"`. Reasoning channel is always on; levels low/medium/high/xhigh exposed, off/minimal/max hidden.
+- **effort style** (Qwen3.8, Muse Glimmer, etc.) — template consumes `reasoning_effort` and/or `reasoning_strength` (detected via the `supports_reasoning_effort` cap; template-text fallback for older builds). Both kwargs keys are sent with the same effort string (server binds one value to both names). Exposed levels are per-model: every exposed level maps to a distinct model tier, levels with no effect are hidden (never clamped).
+  - **Strict templates** self-document tiers and are parsed from the template: `not in ('xhigh', 'medium', 'low')` → level list, `raise_exception('... Supported types are ...')` → fallback, `== 'high' → set 'xhigh'` → alias (e.g. Qwen3.8 exposes off/low/medium/xhigh).
+  - **Free-form templates** (Muse Glimmer, etc.) validate nothing → generic set low/medium/high/xhigh.
+  - `off` is exposed only when the template gates on `enable_thinking` (`none` disables reasoning server-side).
+- **thinking variable style** (DeepSeek, etc.) → effort string via `chatTemplateKwargs.thinking`, `thinkingFormat: "chat-template"`. Levels low/high/max exposed.
+- **enable_thinking toggle** (Gemma4, etc.) → boolean toggle via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Levels off/low/high/max exposed; budget tokens differentiate low vs high.
 
 `thinking_budget_tokens` is injected for a subset of levels (`low` → 512, `high` → 8192); `medium` is intentionally unmapped and falls back to the server's default budget.
 
-Discovered metadata is persisted to `llama-metadata.json` and applied on every model sync.
+Discovered metadata (style + parsed tiers/aliases) is persisted to `llama-metadata.json` and applied on every model sync. Legacy entries (`thinking: true`, `"muse-reasoning-strength"`) map to toggle/effort style respectively.
 
 ## Architecture
 
@@ -84,6 +87,7 @@ Discovered metadata is persisted to `llama-metadata.json` and applied on every m
 - `detectMode(res)` — `models` field present → single, absent → router
 - `ModelInspector.status(id)` — router: from `/models` data; single: from `/props`. Returns `loaded|loading|sleeping|unloaded|failed`
 - `resolveContextSize(model)` — router: parses `--ctx-size`/`-c`/`-ctx`/`--fit-ctx` from `status.args`; single: `meta.n_ctx`, then `n_ctx_train`. Fallback: 32768.
+- `thinking-style.ts` — pure style classification + tier parsing over /props data (no pi dependency)
 - `buildStatusLines(current)` — gathers all data, returns plain string lines
 - `buildBorderDynamic(theme, lines, width)` — wraps lines in box-drawing border using `visibleWidth()` for emoji-safe padding
 
