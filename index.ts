@@ -62,7 +62,6 @@ interface PropsResponse {
   is_sleeping: boolean;
   default_generation_settings?: {
     n_ctx: number;
-    params?: Record<string, any>;
   };
 }
 
@@ -70,7 +69,6 @@ interface SlotInfo {
   is_processing: boolean;
   n_ctx: number;
   next_token?: {
-    has_next_token: boolean;
     n_decoded: number;
     n_remain: number;
   };
@@ -1523,7 +1521,7 @@ function isSseActive(): boolean {
 // Persists model capabilities (thinking, context size) per server:model so it survives model syncs.
 
 interface ModelMetadataEntry {
-  thinking?: boolean | "effort" | "chat-template" | "toggle" | "muse-reasoning-strength";
+  thinking?: "effort" | "chat-template" | "toggle";
   effortLevels?: string[];
   effortAliases?: Record<string, string>;
   effortOff?: boolean;
@@ -1625,13 +1623,10 @@ function applyMetadataOverlay(model: Record<string, any>, serverId: string, over
           off: entry.effortOff === true,
         });
         break;
-      case "muse-reasoning-strength":
-        // Legacy (pre-effort-style): generic free-form tiers, no off path.
-        applyEffortThinkingSupport(model, { off: false });
-        break;
-      default:
-        // "toggle" or legacy true — enable_thinking boolean toggle (Qwen, Gemma4, etc.)
+      case "toggle":
+        // enable_thinking boolean toggle (Qwen, Gemma4, etc.)
         applyEnableThinkingSupport(model);
+        break;
     }
   }
   if (entry.contextWindow) {

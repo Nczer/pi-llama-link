@@ -75,7 +75,7 @@ Autodetects thinking capability from each model's chat template via `/props` (`c
 
 `thinking_budget_tokens` is injected for a subset of levels (`low` → 512, `high` → 8192); `medium` is intentionally unmapped and falls back to the server's default budget.
 
-Discovered metadata (style + parsed tiers/aliases) is persisted to `llama-metadata.json` and applied on every model sync. Legacy entries (`thinking: true`, `"muse-reasoning-strength"`) map to toggle/effort style respectively.
+Discovered metadata (style + parsed tiers/aliases) is persisted to `llama-metadata.json` and applied on every model sync.
 
 ## Architecture
 
