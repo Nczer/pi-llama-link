@@ -66,7 +66,7 @@ On `session_start`, syncs model metadata to `~/.pi/agent/models.json`.
 
 Autodetects thinking capability from each model's chat template via `/props` (`chat_template` + `chat_template_caps`), classified in `thinking-style.ts`:
 
-- **effort style** (Qwen3.8, Muse Glimmer, etc.) — template consumes `reasoning_effort` and/or `reasoning_strength` (detected via the `supports_reasoning_effort` cap; template-text fallback for older builds). Both kwargs keys are sent with the same effort string (server binds one value to both names). Exposed levels are per-model: every exposed level maps to a distinct model tier, levels with no effect are hidden (never clamped).
+- **effort style** (Qwen3.8, Muse Glimmer, etc.) — template consumes `reasoning_effort` and/or `reasoning_strength` (detected via the `supports_reasoning_effort` cap; template-text fallback for older builds). Only the variable name(s) the template actually references are emitted as `chatTemplateKwargs` keys (each bound to the same effort string); caps-only detection (no template text) falls back to emitting both names. Exposed levels are per-model: every exposed level maps to a distinct model tier, levels with no effect are hidden (never clamped).
   - **Strict templates** self-document tiers and are parsed from the template: `not in ('xhigh', 'medium', 'low')` → level list, `raise_exception('... Supported types are ...')` → fallback, `== 'high' → set 'xhigh'` → alias (e.g. Qwen3.8 exposes off/low/medium/xhigh).
   - **Free-form templates** (Muse Glimmer, etc.) validate nothing → generic set low/medium/high/xhigh.
   - `off` is exposed only when the template gates on `enable_thinking` (`none` disables reasoning server-side).
