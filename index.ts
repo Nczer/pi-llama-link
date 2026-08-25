@@ -841,7 +841,6 @@ async function buildStatusLines(current: ProviderModelConfig | undefined): Promi
   const lines: string[] = [];
 
   for (const { server, ready, models, mode } of serverInfo) {
-    // Separate from previous server block
     if (lines.length > 0) lines.push("");
     lines.push(`${server.name}${ready ? "" : " — ⬛ offline"}`);
 
@@ -856,7 +855,6 @@ async function buildStatusLines(current: ProviderModelConfig | undefined): Promi
       return matchModel(m, current.id);
     };
 
-    // Sort so the active Pi model comes first
     loadedModels.sort((a, b) => Number(isCurrent(b)) - Number(isCurrent(a)));
 
     if (loadedModels.length === 0) {
@@ -876,7 +874,6 @@ async function buildStatusLines(current: ProviderModelConfig | undefined): Promi
 
       // Skip live endpoints for sleeping models — they wake the model on the router
       if (!isSleeping) {
-        // Fetch slots, metrics, v1 metadata in parallel
         const [meta, metrics] = await Promise.all([
           inspector.getModelMeta(id),
           inspector.getMetrics(mode === "router" ? id : undefined),
@@ -884,7 +881,6 @@ async function buildStatusLines(current: ProviderModelConfig | undefined): Promi
           inspector.getSlots(mode === "router" ? id : undefined),
         ]);
 
-        // Model metadata
         if (meta) {
           const parts: string[] = [];
           if (meta.n_params) parts.push(`${formatParams(meta.n_params)} params`);
@@ -896,7 +892,6 @@ async function buildStatusLines(current: ProviderModelConfig | undefined): Promi
           }
         }
 
-        // Slot info (always shown when slots endpoint is available)
         const slotInfo = inspector.getSlotInfo(mode === "router" ? id : undefined);
         if (slotInfo.totalSlots > 0) {
           const genInfo: string[] = [`${slotInfo.activeSlots}/${slotInfo.totalSlots} slots`];
@@ -905,7 +900,6 @@ async function buildStatusLines(current: ProviderModelConfig | undefined): Promi
           lines.push(`     ▶ ${genInfo.join(" · ")}`);
         }
 
-        // Metrics
         const metricLines = formatMetrics(metrics);
         if (metricLines.length) {
           lines.push(`     📊 ${metricLines.join(" · ")}`);
@@ -1030,12 +1024,10 @@ async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Pro
     return;
   }
 
-  // Start SSE listener to pick up loading progress
   if (!isSseActive()) {
     startSseForServer(server.id, ctx);
   }
 
-  // If a model ID was provided directly, load it
   if (modelArg) {
     try {
       await loadModelAndWait(server, modelArg, ctx);
@@ -1051,7 +1043,6 @@ async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Pro
     return;
   }
 
-  // No model specified — show selection UI
   const inspector = new ModelInspector(server);
   const models = (await inspector.list()).filter((m) => !isAutoExposedCacheEntry(m));
 
@@ -1193,7 +1184,6 @@ async function syncToModelsJson(
     wrote = true;
   }
 
-  // Prune provider entries for servers no longer configured
   const resolvedIds = new Set(resolveServers().map(s => s.id));
   for (const key of Object.keys(config.providers)) {
     if (!PROVIDER_IDS.includes(key)) continue;
@@ -1209,7 +1199,6 @@ async function syncToModelsJson(
       if (pendingModelsStr) atomicWrite(MODELS_JSON, pendingModelsStr);
       modelsWriteTimer = null;
       pendingModelsStr = null;
-      // Show status notification after write completes
       if (setStatus) {
         if (syncNotifyTimer) clearTimeout(syncNotifyTimer);
         setStatus("\u2713 models synced -- /reload to use");
@@ -1248,7 +1237,6 @@ interface ModelLoadState {
   progress?: SseProgress;
 }
 
-// Active SSE connection state
 let sseAbort: AbortController | null = null;
 let sseServerId: string | "" = "";
 let sseCtx: ExtensionContext | null = null;
@@ -1258,14 +1246,12 @@ let sseClearToken = 0;
 const SSE_MAX_RECONNECT_ATTEMPTS = 10;
 const SSE_INITIAL_RECONNECT_MS = 1000;
 
-/** Stage name → human-readable label */
 const STAGE_LABELS: Record<string, string> = {
   "fit_params": "fitting params",
   "text_model": "model",
   "mmproj_model": "mmproj",
 };
 
-/** Format a stage name for display */
 function formatStage(stage: string): string {
   return STAGE_LABELS[stage] || stage;
 }
@@ -1336,7 +1322,6 @@ async function* parseSseStream(response: Response): AsyncGenerator<string> {
       }
     }
 
-    // Process remaining buffer
     if (buffer.trim()) {
       const lines = buffer.split("\n");
       for (const line of lines) {
@@ -1384,7 +1369,7 @@ async function connectSse(
       return;
     }
 
-    sseReconnectAttempts = 0; // Reset reconnect counter on successful connect
+    sseReconnectAttempts = 0;
 
     for await (const jsonStr of parseSseStream(response)) {
       try {
@@ -1399,7 +1384,6 @@ async function connectSse(
     // AbortError is expected when we intentionally disconnect
     if (msg === "AbortError" || msg === "aborted") return;
 
-    // Server error or network failure — attempt reconnect
     attemptSseReconnect(server, ctx);
   }
 }
@@ -1439,7 +1423,6 @@ function handleSseEvent(
 ): void {
   if (!payload || !payload.model) return;
 
-  // payload.data contains {status, progress, ...}
   const inner = payload.data;
   if (!inner || !inner.status) return;
 
@@ -1497,17 +1480,14 @@ function stopSse(): void {
  * Start SSE listener for a server if not already connected.
  */
 function startSseForServer(serverId: string, ctx: ExtensionContext): void {
-  // If already connected to this server, keep it
   if (sseServerId === serverId) return;
 
-  // Stop existing connection
   stopSse();
 
   const servers = resolveServers();
   const server = servers.find((s) => s.id === serverId);
   if (!server) return;
 
-  // Start SSE connection
   connectSse(server, ctx);
 }
 
@@ -1748,7 +1728,6 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     },
   });
 
-  // Auto-sync on session start
   pi.on("session_start", async (_event: any, ctx: ExtensionContext) => {
     if (!isLlamaStatusEnabled()) return;
     try { await syncToModelsJson((v) => ctx.ui.setStatus("llama", v)); } catch {}
@@ -1765,23 +1744,19 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     }
   });
 
-  // Reconnect SSE if model changes during session
   pi.on("model_select", async (event: any, ctx: ExtensionContext) => {
     if (!isLlamaStatusEnabled()) return;
     const provider = (event.model as any)?.provider;
     if (!provider || !PROVIDER_IDS.includes(provider)) {
-      // Switched away from llama-cpp — stop SSE
       stopSse();
       return;
     }
 
-    // If SSE is already active for this provider, keep it
     if (isSseActive() && sseServerId === provider) return;
 
     startSseForServer(provider, ctx);
   });
 
-  // Clean up SSE connection on session shutdown
   pi.on("session_shutdown", async () => {
     stopSse();
     sseCtx = null;
@@ -1822,7 +1797,6 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
 
   // ── Event Handlers ──────────────────────────────────────────────────
 
-  // Inject thinking_budget_tokens for llama-cpp reasoning models
   pi.on("before_provider_request", (event, ctx) => {
     if (!isLlamaStatusEnabled()) return;
     const provider = (ctx.model as any)?.provider;
@@ -1871,7 +1845,6 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
         try { settings = JSON.parse(readFileSync(settingsPath, "utf-8")); } catch {}
       }
       settings[SETTING_KEY] = !settings[SETTING_KEY];
-      // Sync cache if loaded
       if (cachedSettings !== undefined) {
         cachedSettings[SETTING_KEY] = settings[SETTING_KEY];
       }
