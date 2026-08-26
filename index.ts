@@ -964,6 +964,26 @@ async function showStatus(ctx: ExtensionCommandContext): Promise<void> {
 
 // ── Unload Command ────────────────────────────────────────────────────
 
+/**
+ * Pick the first loaded model that is safe to unload: it has at least one
+ * readable slot and none of them has an in-flight generation.
+ * A model whose slots can't be read (empty response, e.g. request failed)
+ * is skipped — better to refuse than to interrupt a generation we can't see.
+ */
+async function pickIdleLoadedModel(
+  inspector: ModelInspector,
+  loaded: Array<{ id: string; name: string; aliases?: string[]; status: string }>,
+  mode: ServerMode,
+): Promise<{ id: string; name: string; aliases?: string[]; status: string } | undefined> {
+  for (const m of loaded) {
+    const slots = await inspector.getSlots(mode === "router" ? m.id : undefined);
+    if (slots.length === 0) continue; // unverifiable — skip
+    if (slots.some((s) => s.is_processing)) continue; // in use
+    return m;
+  }
+  return undefined;
+}
+
 async function unloadModel(ctx: ExtensionCommandContext): Promise<void> {
   const current = ctx.model;
 
@@ -991,12 +1011,20 @@ async function unloadModel(ctx: ExtensionCommandContext): Promise<void> {
   const mode = detectMode(modelsRes);
   const inspector = new ModelInspector(server, { data: modelsRes.data || [], mode });
   const loadedModels = await inspector.loadedModels();
-  // Prefer the current Pi model; fall back to first loaded
+  // Prefer the current Pi model (explicit intent); otherwise fall back to the
+  // first loaded model with no in-flight generation, never to a busy one
   // (current.id may be an alias, loaded models carry real ids + aliases)
-  const serverModel = loadedModels.find((m) => matchModel(m, current.id)) || loadedModels[0];
+  const serverModel =
+    loadedModels.find((m) => matchModel(m, current.id)) ||
+    (await pickIdleLoadedModel(inspector, loadedModels, mode));
 
   if (!serverModel) {
-    ctx.ui.notify(`${server.name}: no model loaded`, "info");
+    ctx.ui.notify(
+      loadedModels.length
+        ? `${server.name}: no loaded model is idle (${loadedModels.length} loaded, all in use or unreadable) — nothing unloaded`
+        : `${server.name}: no model loaded`,
+      "info",
+    );
     return;
   }
 
