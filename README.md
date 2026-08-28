@@ -48,6 +48,7 @@ Connects to `/models/sse` to show real-time loading progress in the status bar:
 - **Stages**: `fit_params` → `text_model` → `mmproj_model` (for vision models)
 - **Display**: `Loading model 42%`, `Loading mmproj 78%`, etc.
 - **Reconnect**: Auto-reconnects with exponential backoff (up to 10 attempts, capped at 30s)
+- **Update dedup**: Status bar only updates when the progress string actually changes — SSE events fire faster than the percentage does, redundant `setStatus` calls are skipped
 - **Cleanup**: SSE connection stops when session ends or model switches away from llama.cpp
 
 ## Auto-Sync
@@ -61,6 +62,13 @@ On `session_start`, syncs model metadata to `~/.pi/agent/models.json`.
 - Each server writes under its own provider key
 - Filters out auto-exposed HF cache entries (undefined models like `unsloth/Qwen3.6-27B-MTP-GGUF:Q4_K_XL`)
 - Removes provider entries for servers no longer configured (e.g., remote URL unset)
+
+## Session Start
+
+The `session_start` sync reuses a single `/models` fetch per server for both sync and the loaded-model notice:
+
+- **Notice per loaded model**: `Llama.cpp: {model} {status} on {server}` — suffixed `— current model` when it matches the model Pi has selected
+- **Warning** when Pi's selected model is a llama-cpp model that none of the configured servers has loaded (the first request would fail; skipped while a model is still loading)
 
 ## Thinking Support
 

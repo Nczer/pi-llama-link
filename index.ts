@@ -275,6 +275,16 @@ function isLlamaStatusEnabled(): boolean {
   return settings[SETTING_KEY] !== false; // default true
 }
 
+// Dedup for the "llama" status-bar slot. SSE progress events fire faster
+// than the displayed string changes, so redundant setStatus calls (and the
+// TUI re-renders they trigger) are skipped.
+let lastLlamaStatus: string | undefined;
+function setLlamaStatus(ctx: ExtensionContext, value: string | undefined): void {
+  if (value === lastLlamaStatus) return;
+  lastLlamaStatus = value;
+  try { ctx.ui.setStatus("llama", value); } catch { /* stale context */ }
+}
+
 // ── HTTP Client (per-server) ──────────────────────────────────────────
 
 /** Extract error message from llama.cpp-style { error: { message } } payload */
@@ -485,12 +495,12 @@ async function loadModelAndWait(
 
   // Start SSE watcher in background for instant load detection
   const watchPromise = watchModelEvents(server, targetId, combinedSignal, (progress) => {
-    ctx.ui.setStatus("llama", `· ${progress.message}${progress.ratio !== undefined ? ` ${Math.round(progress.ratio * 100)}%` : ""}`);
+    setLlamaStatus(ctx, `· ${progress.message}${progress.ratio !== undefined ? ` ${Math.round(progress.ratio * 100)}%` : ""}`);
   });
 
   try {
     await loadModel(server, targetId);
-    ctx.ui.setStatus("llama", "· Loading model...");
+    setLlamaStatus(ctx, "· Loading model...");
 
     // Poll until loaded, with SSE events providing early hints.
     // Transient failures (503 while the server is busy, network blips) are
@@ -525,7 +535,7 @@ async function loadModelAndWait(
   } finally {
     watcher.abort();
     await watchPromise.catch(() => {});
-    ctx.ui.setStatus("llama", undefined);
+    setLlamaStatus(ctx, undefined);
   }
 }
 
@@ -1156,16 +1166,17 @@ let syncNotifyTimer: NodeJS.Timeout | null = null;
 const SYNC_NOTIFY_DURATION = 3000;
 
 async function syncToModelsJson(
+  serverInfo?: ServerInfo[],
   setStatus?: (value: string | undefined) => void,
 ): Promise<boolean> {
-  const serverInfo = await gatherServers();
+  const info = serverInfo ?? (await gatherServers());
   const config = loadModelsJson();
   const overlay = loadMetadataOverlay();
   let overlayDirty = false;
   let wrote = false;
   const validModels = new Map<string, Set<string>>();
 
-  for (const { server, ready, models } of serverInfo) {
+  for (const { server, ready, models } of info) {
     if (!ready) continue;
 
     // Filter out auto-exposed HF cache entries (undefined models)
@@ -1241,7 +1252,7 @@ async function syncToModelsJson(
   if (overlayDirty) saveMetadataOverlay(overlay);
 
   // Prune metadata for removed/renamed models (only for reachable servers)
-  cleanupStaleMetadata(overlay, validModels, serverInfo.filter((s) => s.ready).map((s) => s.server.id));
+  cleanupStaleMetadata(overlay, validModels, info.filter((s) => s.ready).map((s) => s.server.id));
 
   return wrote;
 }
@@ -1467,7 +1478,7 @@ function handleSseEvent(
       const theme = ctx.ui.theme;
       const progressStr = formatLoadingProgress(state, theme);
       if (progressStr) {
-        ctx.ui.setStatus("llama", progressStr);
+        setLlamaStatus(ctx, progressStr);
       }
 
       // Clear status bar when model is fully loaded.
@@ -1476,9 +1487,7 @@ function handleSseEvent(
       if (status === "loaded") {
         const token = ++sseClearToken;
         setTimeout(() => {
-          if (sseCtx && token === sseClearToken) {
-            try { sseCtx.ui.setStatus("llama", undefined); } catch {}
-          }
+          if (sseCtx && token === sseClearToken) setLlamaStatus(sseCtx, undefined);
         }, 5000);
       }
     } catch {
@@ -1711,16 +1720,61 @@ async function discoverModelMetadata(
     if (!updated) return;
 
     // Lazy re-sync to apply overlay to models.json without blocking
-    void syncToModelsJson((v) => u((c) => c.ui.setStatus("llama", v))).catch(() => {});
+    void syncToModelsJson(undefined, (v) => u((c) => setLlamaStatus(c, v))).catch(() => {});
   } catch (error) {
     const err = error as Error;
     const msg = err.name === "AbortError" ? "timeout" : err.message;
     discoveredMetadata.add(key); // don't retry + notify on every response
-    u((c) => c.ui.setStatus("llama", undefined));
+    u((c) => setLlamaStatus(c, undefined));
     u((c) => c.ui.notify(`[llama-cpp] /props for ${modelId} failed: ${msg}`, "error"));
   } finally {
     clearTimeout(timer);
     pendingMetadata.delete(key);
+  }
+}
+
+// ── Session-start notice ──────────────────────────────────────────────
+
+/**
+ * Announce loaded models at session start so the user can see at a glance
+ * whether the server's loaded model is the one Pi has selected.
+ * Also warns when the selected model is a llama-cpp model that none of the
+ * configured servers has loaded (the first request would fail).
+ */
+async function announceLoadedModels(serverInfo: ServerInfo[], ctx: ExtensionContext): Promise<void> {
+  const current = ctx.model;
+  const currentProvider = (current as any)?.provider;
+
+  for (const { server, ready, models, mode } of serverInfo) {
+    if (!ready || !mode || models.length === 0) continue;
+    const inspector = new ModelInspector(server, { data: models, mode });
+
+    let loaded: Array<{ id: string; name: string; aliases?: string[]; status: string }>;
+    try {
+      loaded = await inspector.loadedModels();
+    } catch {
+      continue;
+    }
+
+    const isCurrent = (m: { id: string; aliases?: string[] }): boolean =>
+      currentProvider === server.id && matchModel(m, current!.id);
+
+    for (const m of loaded) {
+      ctx.ui.notify(
+        `${PROVIDER_NAME}: ${m.name} ${m.status} on ${server.name}${isCurrent(m) ? " — current model" : ""}`,
+        "info",
+      );
+    }
+
+    if (currentProvider === server.id && !loaded.some(isCurrent)) {
+      const status = await inspector.status(current!.id).catch(() => "unknown");
+      if (status !== "loading") {
+        ctx.ui.notify(
+          `${PROVIDER_NAME}: ${current!.id} not loaded on ${server.name} -- /llama-load ${current!.id}`,
+          "warning",
+        );
+      }
+    }
   }
 }
 
@@ -1758,7 +1812,12 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event: any, ctx: ExtensionContext) => {
     if (!isLlamaStatusEnabled()) return;
-    try { await syncToModelsJson((v) => ctx.ui.setStatus("llama", v)); } catch {}
+    try {
+      // One /models fetch per server, shared by sync and the loaded-model notice
+      const serverInfo = await gatherServers();
+      await syncToModelsJson(serverInfo, (v) => setLlamaStatus(ctx, v));
+      await announceLoadedModels(serverInfo, ctx);
+    } catch {}
   });
 
   // ── SSE Model Loading Progress ──────────────────────────────────────
@@ -1880,7 +1939,7 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
       atomicWrite(settingsPath, JSON.stringify(settings, null, 2) + "\n");
       if (!settings[SETTING_KEY]) {
         stopSse();
-        ctx.ui.setStatus("llama", undefined);
+        setLlamaStatus(ctx, undefined);
       }
       ctx.ui.notify(settings[SETTING_KEY] ? "Llama link enabled" : "Llama link disabled", settings[SETTING_KEY] ? "info" : "warning");
     },
