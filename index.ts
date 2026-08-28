@@ -1738,8 +1738,8 @@ async function discoverModelMetadata(
 /**
  * Announce loaded models at session start so the user can see at a glance
  * whether the server's loaded model is the one Pi has selected.
- * Also warns when the selected model is a llama-cpp model that none of the
- * configured servers has loaded (the first request would fail).
+ * Also warns when the selected model is not loaded while another model is
+ * loaded on the same server (an unloaded-but-free server is not a conflict).
  */
 async function announceLoadedModels(serverInfo: ServerInfo[], ctx: ExtensionContext): Promise<void> {
   const current = ctx.model;
@@ -1766,7 +1766,9 @@ async function announceLoadedModels(serverInfo: ServerInfo[], ctx: ExtensionCont
       );
     }
 
-    if (currentProvider === server.id && !loaded.some(isCurrent)) {
+    // Warn only when another model is loaded on this server but the selected
+    // one isn't — with nothing loaded there is no conflict to warn about.
+    if (currentProvider === server.id && loaded.length > 0 && !loaded.some(isCurrent)) {
       const status = await inspector.status(current!.id).catch(() => "unknown");
       if (status !== "loading") {
         ctx.ui.notify(
