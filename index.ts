@@ -9,6 +9,7 @@ import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 import { classifyThinkingStyle, buildEffortLevelMap, type EffortStyle } from "./thinking-style";
 import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { loadExtSettings, patchExtSettings } from "./ext-settings";
 
 const PROVIDER_NAME = "Llama.cpp";
 const API_KEY_PLACEHOLDER = "sk-placeholder";
@@ -34,7 +35,19 @@ const PROVIDER_IDS = ["llama-cpp", "llama-cpp-remote", "llama-server"];
 const apiKeyCache = new Map<string, string>();
 const RPC_TIMEOUT = 2000; // 2s timeout for all server requests
 const PROPS_TIMEOUT_MS = 120_000; // 2min timeout for /props (model loading can be slow)
-const SETTING_KEY = "llamaLinkEnabled";
+/** Extension settings: the "llama-link" namespace of the shared
+ *  settings-ext.json (defaults materialized on first load). */
+interface LlamaLinkSettings {
+  enabled: boolean;
+  serverUrl: string;
+  remoteUrl: string | null;
+}
+
+const LLAMA_LINK_DEFAULTS: LlamaLinkSettings = {
+  enabled: true,
+  serverUrl: "http://127.0.0.1:8080",
+  remoteUrl: null,
+};
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -196,33 +209,27 @@ function applyEffortThinkingSupport(model: Record<string, any>, effort: EffortSt
 
 // ── Config Resolution ─────────────────────────────────────────────────
 
-let cachedSettings: Record<string, any> | undefined;
+let cachedSettings: LlamaLinkSettings | undefined;
 let modelsWriteTimer: NodeJS.Timeout | null = null;
 let metadataWriteTimer: NodeJS.Timeout | null = null;
 let pendingModelsStr: string | null = null;
 let pendingMetadataStr: string | null = null;
 
-function loadSettings(): Record<string, any> {
+function loadSettings(): LlamaLinkSettings {
   if (cachedSettings !== undefined) return cachedSettings;
-  const path = join(process.env.HOME || ".", ".pi", "agent", "settings.json");
-  let settings: Record<string, any> = {};
-  if (existsSync(path)) {
-    try { settings = JSON.parse(readFileSync(path, "utf-8")); } catch {}
-  }
-  return (cachedSettings = settings);
+  return (cachedSettings = loadExtSettings("llama-link", LLAMA_LINK_DEFAULTS));
 }
 
 function resolveLocalUrl(): string {
   const envOverride = process.env.LLAMA_SERVER_URL;
   const settings = loadSettings();
-  const settingsOverride = settings?.llamaServerUrl;
 
-  return (envOverride || settingsOverride || "http://127.0.0.1:8080").replace(/\/+$/, "");
+  return (envOverride || settings.serverUrl || "http://127.0.0.1:8080").replace(/\/+$/, "");
 }
 
 function resolveRemoteUrl(): string | undefined {
   const settings = loadSettings();
-  const raw = settings?.llamaServerRemoteUrl;
+  const raw = settings.remoteUrl;
   if (!raw) return undefined;
   return raw.replace(/\/+$/, "");
 }
@@ -271,8 +278,7 @@ function resolveApiKey(serverId: string): string {
 }
 
 function isLlamaStatusEnabled(): boolean {
-  const settings = loadSettings();
-  return settings[SETTING_KEY] !== false; // default true
+  return loadSettings().enabled !== false; // default true
 }
 
 // Dedup for the "llama" status-bar slot. SSE progress events fire faster
@@ -1928,22 +1934,15 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     description: "Toggle llama-link extension on/off",
     handler: async (_args, ctx) => {
       // Re-read fresh from disk to avoid clobbering external edits
-      const settingsPath = join(process.env.HOME || ".", ".pi", "agent", "settings.json");
-      let settings: Record<string, any> = {};
-      if (existsSync(settingsPath)) {
-        try { settings = JSON.parse(readFileSync(settingsPath, "utf-8")); } catch {}
-      }
-      settings[SETTING_KEY] = !settings[SETTING_KEY];
-      if (cachedSettings !== undefined) {
-        cachedSettings[SETTING_KEY] = settings[SETTING_KEY];
-      }
-      mkdirSync(join(process.env.HOME || ".", ".pi", "agent"), { recursive: true });
-      atomicWrite(settingsPath, JSON.stringify(settings, null, 2) + "\n");
-      if (!settings[SETTING_KEY]) {
+      cachedSettings = undefined;
+      const next = !loadSettings().enabled;
+      patchExtSettings("llama-link", { enabled: next });
+      cachedSettings = loadSettings(); // cache now holds the patched value
+      if (!next) {
         stopSse();
         setLlamaStatus(ctx, undefined);
       }
-      ctx.ui.notify(settings[SETTING_KEY] ? "Llama link enabled" : "Llama link disabled", settings[SETTING_KEY] ? "info" : "warning");
+      ctx.ui.notify(next ? "Llama link enabled" : "Llama link disabled", next ? "info" : "warning");
     },
   });
 
