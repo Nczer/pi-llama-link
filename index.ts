@@ -11,6 +11,25 @@ import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from "
 import { join } from "node:path";
 import { loadExtSettings, patchExtSettings } from "./ext-settings";
 
+// ── Pre-emption self-close ─────────────────────────────────────
+// A focused overlay renders on every TUI pass, but keyboard input routes to
+// the FOCUSED component — so when another UI (a consult/quiz/halter prompt,
+// a native selector, …) takes focus, this overlay would stay visible while
+// being impossible to dismiss. Render-time check: if we are visible but no
+// longer focused, close ourselves so the prompt underneath is reachable.
+// getFocusedComponent() is a TUI class method (used by pi's interactive mode)
+// that is NOT on the public TUI interface; if a future pi removes it, the
+// check is skipped and plain Esc/q close remains.
+function makePreemptClose(tui: any, self: unknown, done: () => void): boolean {
+  const getFocused = tui?.getFocusedComponent;
+  if (typeof getFocused !== "function") return false;
+  if (getFocused.call(tui) !== self) {
+    done();
+    return true; // pre-empted — caller should return [] for this frame
+  }
+  return false;
+}
+
 const PROVIDER_NAME = "Llama.cpp";
 const API_KEY_PLACEHOLDER = "sk-placeholder";
 const MODELS_JSON = join(process.env.HOME || ".", ".pi", "agent", "models.json");
@@ -944,14 +963,15 @@ async function showStatus(ctx: ExtensionCommandContext): Promise<void> {
   const contentLines = await buildStatusLines(ctx.model);
 
   await ctx.ui.custom<void>(
-    (_tui, theme, _keybindings, done) => {
-      return {
+    (tui, theme, _keybindings, done) => {
+      const overlay = {
         handleInput(data: string) {
           if (matchesKey(data, "escape") || matchesKey(data, "q")) {
             done(undefined);
           }
         },
         render(width: number): string[] {
+          if (makePreemptClose(tui, overlay, () => done(undefined))) return [];
           const overlayLines = [
             theme.bold(theme.fg("accent", `${PROVIDER_NAME} Status`)),
             "",
@@ -965,6 +985,7 @@ async function showStatus(ctx: ExtensionCommandContext): Promise<void> {
         },
         invalidate() {},
       };
+      return overlay;
     },
     {
       overlay: true,
