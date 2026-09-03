@@ -670,10 +670,6 @@ function resolveContextSize(m: ModelsDataProperty): number {
   return 32768;
 }
 
-function findServerByProvider(provider: string, servers: ServerConfig[]): ServerConfig | undefined {
-  return servers.find((s) => s.id === provider);
-}
-
 /**
  * Map each server model's real id to the id used in models.json:
  * the first alias when present and not claimed by another model,
@@ -720,7 +716,6 @@ async function gatherServers(): Promise<ServerInfo[]> {
 
 // ── Status Indicator ──────────────────────────────────────────────────
 
-const OVERLAY_WIDTH = 70;
 const STATUS_ICONS: Record<string, string> = {
   loaded: "🟢",
   loading: "🟡",
@@ -910,7 +905,7 @@ async function showStatus(ctx: ExtensionCommandContext): Promise<void> {
       overlayOptions: {
         anchor: "center",
         width: "80%",
-        minWidth: OVERLAY_WIDTH,
+        minWidth: 70,
         maxHeight: "90%",
       },
     },
@@ -949,7 +944,7 @@ async function unloadModel(ctx: ExtensionCommandContext): Promise<void> {
   }
 
   const servers = resolveServers();
-  const server = findServerByProvider(modelProvider, servers);
+  const server = servers.find((s) => s.id === modelProvider);
 
   if (!server) {
     ctx.ui.notify(`No server found for provider ${modelProvider}`, "error");
@@ -997,7 +992,7 @@ async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Pro
   const servers = resolveServers();
   const modelProvider = (ctx.model as any)?.provider;
   const server = (modelProvider && PROVIDER_IDS.includes(modelProvider))
-    ? findServerByProvider(modelProvider, servers) || servers[0]
+    ? servers.find((s) => s.id === modelProvider) || servers[0]
     : servers[0];
 
   try {
@@ -1599,7 +1594,6 @@ async function discoverModelMetadata(
   serverId: string,
   modelId: string,
   ctx?: ExtensionContext,
-  timeoutMs = PROPS_TIMEOUT_MS,
 ): Promise<void> {
   const servers = resolveServers();
   const server = servers.find((s) => s.id === serverId);
@@ -1611,7 +1605,7 @@ async function discoverModelMetadata(
 
   pendingMetadata.add(key);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), PROPS_TIMEOUT_MS);
   const propsUrl = `${server.url.replace(/\/+$/, "")}/props?model=${encodeURIComponent(modelId)}&autoload=false`;
 
   // Safe ctx wrapper — session can be replaced after model switch, making ctx stale
@@ -1850,12 +1844,7 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     if (!model) return;
     const provider = (model as any)?.provider;
     if (!PROVIDER_IDS.includes(provider || "")) return;
-    void discoverModelMetadata(
-      provider,
-      model.id,
-      ctx,
-      PROPS_TIMEOUT_MS,
-    );
+    void discoverModelMetadata(provider, model.id, ctx);
   });
 
   pi.registerCommand("llama-link", {
