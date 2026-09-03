@@ -5,8 +5,10 @@
  * no pi or server dependencies — kept separate so it can be unit-tested.
  *
  * Style priority:
- *   1. "effort" — template consumes reasoning_effort / reasoning_strength
- *                  (effort string; server binds one value to both names)
+ *   1. "effort" — template consumes an effort string variable:
+ *                  reasoning_effort / reasoning_strength (standard)
+ *                  or thinking_effort (Kimi-K3 family; caps can't probe it,
+ *                  text detection only)
  *   2. "toggle" — enable_thinking boolean toggle only
  *
  * Note: real DeepSeek templates gate on `thinking` in `{% if ... %}` form and
@@ -14,8 +16,8 @@
  * they never reference `{{ thinking }}`, so no dedicated style is needed.
  *
  * Tier exposure: only levels the chat template actually distinguishes are
- * exposed. Tiers are parsed from the template's own reasoning_effort /
- * reasoning_strength usage (line-scoped):
+ * exposed. Tiers are parsed from the template's own effort-variable usage
+ * (line-scoped):
  *   == 'v' / != 'v' / in [...] / not in [...]          → level (or off-token)
  *   set reasoning_effort = 'v' / else 'v'              → default level
  *   effort concatenated into the prompt, no comparables → free-form → generic
@@ -45,6 +47,13 @@ const EFFORT_VOCABULARY = new Set([
 /** Effort-vocabulary values that mean "thinking off" in the template. */
 const OFF_TOKENS = new Set(["none", "off", "no_think"]);
 
+/** Effort string variable names templates may consume. */
+export const EFFORT_VAR_NAMES = ["reasoning_effort", "reasoning_strength", "thinking_effort"] as const;
+
+/** Shared fragment for the variable-name alternation in the parse regexes. */
+const EFFORT_VAR = "(?:reasoning_effort|reasoning_strength|thinking_effort)";
+const EFFORT_VAR_WORD = new RegExp(`\\b${EFFORT_VAR}\\b`);
+
 export interface EffortStyle {
   /** Parsed valid tiers; undefined → generic set; [] → none beyond off. */
   levels?: string[];
@@ -59,8 +68,8 @@ export interface EffortStyle {
   offToken?: string;
   /**
    * Variable names the template actually references (subset of
-   * ["reasoning_effort", "reasoning_strength"]); undefined → unknown
-   * (caps-only detection, no template text) → send both.
+   * EFFORT_VAR_NAMES); undefined → unknown (caps-only detection, no
+   * template text) → send the two standard names.
    */
   varNames?: string[];
 }
@@ -98,12 +107,12 @@ export function extractEffortLiterals(ct: string): EffortLiterals | undefined {
   };
 
   for (const line of ct.split("\n")) {
-    if (!/\breasoning_(?:effort|strength)\b/.test(line)) continue;
+    if (!EFFORT_VAR_WORD.test(line)) continue;
     seen = true;
 
     // == / != against a literal (optionally through a Jinja filter: `| lower`)
     for (const m of line.matchAll(
-      /\breasoning_(?:effort|strength)\b(?:\s*\|\s*[a-z_]+(?:\([^)]*\))?)?\s*[!=]=\s*['"]([a-z_]+)['"]/g,
+      new RegExp(`\\b${EFFORT_VAR}\\b(?:\\s*\\|\\s*[a-z_]+(?:\\([^)]*\\))?)?\\s*[!=]=\\s*['"]([a-z_]+)['"]`, "g"),
     )) push(compared, m[1]);
 
     // not in [..] / (..)
@@ -111,12 +120,12 @@ export function extractEffortLiterals(ct: string): EffortLiterals | undefined {
     // bare `in [..]` / `( .. )` (excluding `not in` matches above)
     for (const m of line.matchAll(/(?<!not\s)(?<!\w)\bin\s*[\[(]([^)\]]*)[\])]/g)) pushList(compared, m[1]);
 
-    // Default assignments: set reasoning_effort = 'v'  /  ... else 'v'
-    for (const m of line.matchAll(/\bset\s+reasoning_(?:effort|strength)\s*=\s*['"]([a-z_]+)['"]/g)) push(defaults, m[1]);
+    // Default assignments: set <effort var> = 'v'  /  ... else 'v'
+    for (const m of line.matchAll(new RegExp(`\\bset\\s+${EFFORT_VAR}\\s*=\\s*['"]([a-z_]+)['"]`, "g"))) push(defaults, m[1]);
     for (const m of line.matchAll(/\belse\s+['"]([a-z_]+)['"]/g)) push(defaults, m[1]);
 
     // Effort string concatenated into the prompt (free-form interpolation)
-    if (/\+\s*reasoning_(?:effort|strength)\b|\breasoning_(?:effort|strength)\s*\+/.test(line)) {
+    if (new RegExp(`\\+\\s*${EFFORT_VAR}\\b|\\b${EFFORT_VAR}\\s*\\+`).test(line)) {
       interpolated = true;
     }
   }
@@ -183,10 +192,12 @@ export function parseEffortTemplate(ct: string): EffortStyle {
   }
 
   // Variable names the template actually reads — caps probes can't
-  // distinguish the two, but the template text can.
+  // distinguish them (and don't probe thinking_effort at all), but the
+  // template text can.
   const varNames: string[] = [];
-  if (/reasoning_effort\b/.test(ct)) varNames.push("reasoning_effort");
-  if (/reasoning_strength\b/.test(ct)) varNames.push("reasoning_strength");
+  for (const name of EFFORT_VAR_NAMES) {
+    if (ct.includes(name)) varNames.push(name);
+  }
 
   return {
     levels,
@@ -213,7 +224,8 @@ export function classifyThinkingStyle(data: {
   const usesEffort =
     caps?.supports_reasoning_effort === true ||
     /reasoning_effort\b/.test(ct) ||
-    /reasoning_strength\b/.test(ct);
+    /reasoning_strength\b/.test(ct) ||
+    /thinking_effort\b/.test(ct);
   if (usesEffort) {
     return { style: "effort", effort: parseEffortTemplate(ct) };
   }

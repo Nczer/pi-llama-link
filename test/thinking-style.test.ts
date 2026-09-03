@@ -61,6 +61,26 @@ describe("classifyThinkingStyle", () => {
     const ct = "{% if enable_thinking %}{% if reasoning_effort %}{{ reasoning_effort }}{% endif %}{% endif %}";
     expect(classifyThinkingStyle({ chat_template: ct }).style).toBe("effort");
   });
+
+  it("classifies a thinking_effort template (Kimi-K3 shape) as effort", () => {
+    const ct = [
+      "{%- if thinking_effort is undefined -%}",
+      "    {%- set thinking_effort = 'max' -%}",
+      "{%- endif -%}",
+      "{%- if thinking and thinking_effort is not none and thinking_effort not in ['low', 'high', 'max'] -%}",
+      "    raise",
+      "{%- endif -%}",
+    ].join("\n");
+    const s = classifyThinkingStyle({ chat_template: ct });
+    expect(s.style).toBe("effort");
+    expect(s.effort?.varNames).toEqual(["thinking_effort"]);
+    expect(s.effort?.levels).toEqual(["low", "high", "max"]);
+    // `is not none` is unquoted Jinja none, not a string off-token — and
+    // there is no enable_thinking gate, so off stays hidden.
+    expect(s.effort?.offToken).toBeUndefined();
+    expect(s.effort?.off).toBe(false);
+    expect(s.effort?.aliases).toBeUndefined();
+  });
 });
 
 describe("parseEffortTemplate", () => {

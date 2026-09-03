@@ -74,6 +74,14 @@ describe("thinkingBudgetFor", () => {
     expect(level(model)("low")).toBeUndefined();
   });
 
+  it("never injects for thinking_effort-style models (Kimi-K3 shape)", () => {
+    const model = {
+      reasoning: true,
+      compat: { chatTemplateKwargs: { thinking_effort: { "$var": "thinking.effort" } } },
+    };
+    expect(level(model)("low")).toBeUndefined();
+  });
+
   it("maps low→512 and high→8192", () => {
     const toggle: Record<string, any> = {};
     applyEnableThinkingSupport(toggle);

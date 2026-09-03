@@ -79,13 +79,13 @@ export function applyEffortThinkingSupport(model: Record<string, any>, effort: E
  * Decide thinking_budget_tokens for a request payload, or undefined to
  * inject nothing:
  *  • non-reasoning models → never
- *  • effort-style models (consume reasoning_effort/reasoning_strength, not
- *    a budget) → never
+ *  • effort-style models (consume an effort string variable, not a budget)
+ *    → never
  *  • unmapped levels (off, max, medium) → server default
  */
 export function thinkingBudgetFor(model: Record<string, any>, level: string): number | undefined {
   if (!model?.reasoning) return undefined;
   const kwargs = model?.compat?.chatTemplateKwargs;
-  if (kwargs?.reasoning_effort || kwargs?.reasoning_strength) return undefined;
+  if (kwargs?.reasoning_effort || kwargs?.reasoning_strength || kwargs?.thinking_effort) return undefined;
   return THINKING_BUDGET_MAP[level];
 }
