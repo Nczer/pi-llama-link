@@ -79,7 +79,7 @@ export function parseEffortTemplate(ct: string): EffortStyle {
     if (m) {
       const values = m[1]
         .split(/,|\band\b/)
-        .map((s) => s.replace(/\s*\(default\)/i, "").trim())
+        .map((s) => s.replace(/\s*\(default\)/i, "").trim().replace(/[.!?]+$/, ""))
         .filter((s) => /^[A-Za-z0-9_]+$/.test(s));
       if (values.length >= 2) levels = values;
     }
