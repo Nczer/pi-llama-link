@@ -6,15 +6,20 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
-import { classifyThinkingStyle } from "./thinking-style";
+import { thinkingBudgetFor } from "./thinking";
 import {
-  applyEnableThinkingSupport,
-  applyEffortThinkingSupport,
-  thinkingBudgetFor,
-} from "./thinking";
-import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
+  loadMetadataOverlay,
+  saveMetadataOverlay,
+  cleanupStaleMetadata,
+  migrateMetadataKeys,
+  applyMetadataOverlay,
+  discoverModelMetadata,
+  flushMetadataWrite,
+  resetDiscoveryState,
+} from "./metadata";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { patchExtSettings } from "./ext-settings";
+import { patchExtSettings, atomicWrite } from "./ext-settings";
 import {
   PROVIDER_NAME,
   API_KEY_PLACEHOLDER,
@@ -63,7 +68,6 @@ function makePreemptClose(tui: any, self: unknown, done: () => void): boolean {
 }
 
 const MODELS_JSON = join(process.env.HOME || ".", ".pi", "agent", "models.json");
-const METADATA_JSON = join(process.env.HOME || ".", ".pi", "agent", "llama-metadata.json");
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -77,11 +81,10 @@ interface ModelsJson {
 
 // ── Config Resolution ─────────────────────────────────────────────────
 // Settings loading, server resolution, per-server auth: server.ts.
+// Metadata store + lazy /props discovery: metadata.ts.
 
 let modelsWriteTimer: NodeJS.Timeout | null = null;
-let metadataWriteTimer: NodeJS.Timeout | null = null;
 let pendingModelsStr: string | null = null;
-let pendingMetadataStr: string | null = null;
 
 function isLlamaStatusEnabled(): boolean {
   return loadSettings().enabled !== false; // default true
@@ -483,13 +486,6 @@ function loadModelsJson(): ModelsJson {
   return { providers: {} };
 }
 
-/** Write via temp file + rename so a crash can't leave a half-written JSON */
-function atomicWrite(path: string, content: string): void {
-  const tmp = `${path}.tmp`;
-  writeFileSync(tmp, content);
-  renameSync(tmp, path);
-}
-
 function modelsChanged(
   existing: any[],
   incoming: Array<{ id: string; contextWindow: number; input: string[]; reasoning?: boolean }>,
@@ -602,12 +598,6 @@ async function syncToModelsJson(
 
   return wrote;
 }
-
-// ── Lazy /props Metadata Discovery ────────────────────────────────────
-
-// Track which server:model combos have been discovered to avoid duplicate queries
-const discoveredMetadata = new Set<string>();
-const pendingMetadata = new Set<string>();
 
 // ── SSE Model Loading Progress ────────────────────────────────────────
 
@@ -881,200 +871,6 @@ function isSseActive(): boolean {
   return sseServerId !== "" && PROVIDER_IDS.includes(sseServerId);
 }
 
-// ── Metadata Overlay ──────────────────────────────────────────────────
-// Persists model capabilities (thinking, context size) per server:model so it survives model syncs.
-
-interface ModelMetadataEntry {
-  thinking?: "effort" | "toggle";
-  effortLevels?: string[];
-  effortAliases?: Record<string, string>;
-  effortOff?: boolean;
-  contextWindow?: number;
-}
-
-interface ModelMetadata {
-  [serverId: string]: { [modelId: string]: ModelMetadataEntry };
-}
-
-function loadMetadataOverlay(): ModelMetadata {
-  if (existsSync(METADATA_JSON)) {
-    try { return JSON.parse(readFileSync(METADATA_JSON, "utf-8")); } catch {}
-  }
-  return {};
-}
-
-function saveMetadataOverlay(metadata: ModelMetadata): void {
-  if (metadataWriteTimer) clearTimeout(metadataWriteTimer);
-  pendingMetadataStr = JSON.stringify(metadata, null, 2) + "\n";
-  metadataWriteTimer = setTimeout(() => {
-    if (pendingMetadataStr) atomicWrite(METADATA_JSON, pendingMetadataStr);
-    metadataWriteTimer = null;
-    pendingMetadataStr = null;
-  }, 1000);
-}
-
-function cleanupStaleMetadata(overlay: ModelMetadata, validModels: Map<string, Set<string>>, reachableServers: string[]): void {
-  let pruned = false;
-  for (const serverId of Object.keys(overlay)) {
-    // Skip servers that weren't reachable — don't delete their metadata
-    if (!reachableServers.includes(serverId)) continue;
-
-    const valid = validModels.get(serverId);
-    if (!valid) {
-      delete overlay[serverId];
-      pruned = true;
-      continue;
-    }
-    for (const modelId of Object.keys(overlay[serverId])) {
-      if (!valid.has(modelId)) {
-        delete overlay[serverId][modelId];
-        pruned = true;
-      }
-    }
-    if (Object.keys(overlay[serverId]).length === 0) {
-      delete overlay[serverId];
-      pruned = true;
-    }
-  }
-  if (pruned) {
-    saveMetadataOverlay(overlay);
-  }
-}
-
-/**
- * Re-key persisted metadata entries from real server ids to the alias ids
- * used in models.json, so thinking/context overrides survive the id switch.
- * Existing alias-keyed entries win over stale real-id entries.
- */
-function migrateMetadataKeys(overlay: ModelMetadata, serverId: string, apiIds: Map<string, string>): boolean {
-  const srv = overlay[serverId];
-  if (!srv) return false;
-  let changed = false;
-  for (const [realId, apiId] of apiIds) {
-    if (realId === apiId || !srv[realId]) continue;
-    if (srv[apiId]) {
-      delete srv[realId];
-    } else {
-      srv[apiId] = srv[realId];
-      delete srv[realId];
-    }
-    changed = true;
-  }
-  return changed;
-}
-
-function persistModelMetadata(serverId: string, modelId: string, data: ModelMetadataEntry): void {
-  const overlay = loadMetadataOverlay();
-  if (!overlay[serverId]) overlay[serverId] = {};
-  const existing = overlay[serverId][modelId] || {};
-  overlay[serverId][modelId] = { ...existing, ...data };
-  saveMetadataOverlay(overlay);
-}
-
-function applyMetadataOverlay(model: Record<string, any>, serverId: string, overlay?: ModelMetadata): void {
-  const data = overlay ?? loadMetadataOverlay();
-  const entry = data[serverId]?.[model.id];
-  if (!entry) return;
-  if (entry.thinking) {
-    switch (entry.thinking) {
-      case "effort":
-        applyEffortThinkingSupport(model, {
-          levels: entry.effortLevels,
-          aliases: entry.effortAliases,
-          off: entry.effortOff === true,
-        });
-        break;
-      case "toggle":
-        // enable_thinking boolean toggle (Qwen, Gemma4, etc.)
-        applyEnableThinkingSupport(model);
-        break;
-    }
-  }
-  if (entry.contextWindow) {
-    model.contextWindow = entry.contextWindow;
-    model.maxTokens = entry.contextWindow;
-  }
-}
-
-async function discoverModelMetadata(
-  serverId: string,
-  modelId: string,
-  ctx?: ExtensionContext,
-): Promise<void> {
-  const servers = resolveServers();
-  const server = servers.find((s) => s.id === serverId);
-  if (!server) return;
-
-  const key = `${serverId}:${modelId}`;
-  if (discoveredMetadata.has(key)) return;
-  if (pendingMetadata.has(key)) return;
-
-  pendingMetadata.add(key);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), PROPS_TIMEOUT_MS);
-  const propsUrl = `${server.url.replace(/\/+$/, "")}/props?model=${encodeURIComponent(modelId)}&autoload=false`;
-
-  // Safe ctx wrapper — session can be replaced after model switch, making ctx stale
-  const u = (fn: (c: ExtensionContext) => void) => { try { if (ctx) fn(ctx); } catch {} };
-
-  try {
-    const response = await fetch(propsUrl, {
-      signal: controller.signal,
-      headers: {
-        ...(resolveApiKey(serverId) !== API_KEY_PLACEHOLDER ? { Authorization: `Bearer ${resolveApiKey(serverId)}` } : {}),
-      },
-    });
-
-    if (!response.ok) {
-      discoveredMetadata.add(key); // don't retry + notify on every response
-      u((c) => c.ui.notify(`[llama-cpp] /props for ${modelId} returned ${response.status}`, "error"));
-      return;
-    }
-
-    const data = await response.json();
-    let updated = false;
-    const metadata: ModelMetadataEntry = {};
-
-    // Effort styles (reasoning_effort/reasoning_strength) are classified first:
-    // templates like Qwen3.8 have both enable_thinking and a tiered effort var.
-    const style = classifyThinkingStyle(data);
-    if (style.style !== "none") {
-      metadata.thinking = style.style;
-      if (style.style === "effort" && style.effort) {
-        if (style.effort.levels) metadata.effortLevels = style.effort.levels;
-        if (style.effort.aliases) metadata.effortAliases = style.effort.aliases;
-        metadata.effortOff = style.effort.off;
-      }
-      updated = true;
-    }
-
-    if (data?.default_generation_settings?.n_ctx) {
-      metadata.contextWindow = data.default_generation_settings.n_ctx;
-      updated = true;
-    }
-
-    if (Object.keys(metadata).length > 0) {
-      persistModelMetadata(serverId, modelId, metadata);
-    }
-
-    discoveredMetadata.add(key);
-
-    if (!updated) return;
-
-    // Lazy re-sync to apply overlay to models.json without blocking
-    void syncToModelsJson(undefined, (v) => u((c) => setLlamaStatus(c, v))).catch(() => {});
-  } catch (error) {
-    const err = error as Error;
-    const msg = err.name === "AbortError" ? "timeout" : err.message;
-    discoveredMetadata.add(key); // don't retry + notify on every response
-    u((c) => setLlamaStatus(c, undefined));
-    u((c) => c.ui.notify(`[llama-cpp] /props for ${modelId} failed: ${msg}`, "error"));
-  } finally {
-    clearTimeout(timer);
-    pendingMetadata.delete(key);
-  }
-}
-
 // ── Session-start notice ──────────────────────────────────────────────
 
 /**
@@ -1193,12 +989,10 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     sseCtx = null;
     // Flush pending debounced writes before clearing
     if (pendingModelsStr) { atomicWrite(MODELS_JSON, pendingModelsStr); pendingModelsStr = null; }
-    if (pendingMetadataStr) { atomicWrite(METADATA_JSON, pendingMetadataStr); pendingMetadataStr = null; }
     if (modelsWriteTimer) { clearTimeout(modelsWriteTimer); modelsWriteTimer = null; }
-    if (metadataWriteTimer) { clearTimeout(metadataWriteTimer); metadataWriteTimer = null; }
+    flushMetadataWrite();
     clearCaches();
-    discoveredMetadata.clear();
-    pendingMetadata.clear();
+    resetDiscoveryState();
   });
 
   // ── Additional Commands ─────────────────────────────────────────────
@@ -1249,7 +1043,15 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     if (!model) return;
     const provider = (model as any)?.provider;
     if (!PROVIDER_IDS.includes(provider || "")) return;
-    void discoverModelMetadata(provider, model.id, ctx);
+    void discoverModelMetadata(provider, model.id, {
+      notify: (msg, type) => {
+        try { ctx.ui.notify(msg, type); } catch { /* stale context */ }
+      },
+      onStatus: (s) => setLlamaStatus(ctx, s),
+      onUpdated: () => {
+        void syncToModelsJson(undefined, (v) => setLlamaStatus(ctx, v)).catch(() => {});
+      },
+    });
   });
 
   pi.registerCommand("llama-link", {

@@ -16,12 +16,21 @@
  *    extensions' namespaces are preserved.
  *
  * `filePath` is a test seam (defaults to the production path).
+ *
+ * Also hosts `atomicWrite`, shared by the metadata store and models.json sync.
  */
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
 export const SETTINGS_PATH = path.join(os.homedir(), ".pi", "agent", "settings-ext.json");
+
+/** Write via temp file + rename so a crash can't leave a half-written JSON. */
+export function atomicWrite(p: string, content: string): void {
+  const tmp = `${p}.tmp`;
+  fs.writeFileSync(tmp, content);
+  fs.renameSync(tmp, p);
+}
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);

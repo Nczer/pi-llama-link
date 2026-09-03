@@ -94,6 +94,7 @@ Discovered metadata (style + parsed tiers/aliases) is persisted to `llama-metada
 
 - `index.ts` — pi glue: hooks, commands, TUI (status overlay, SSE loading indicator), metadata overlay + sync orchestration
 - `server.ts` — server layer: server resolution + per-server auth, `rpc()` JSON client + SSE stream parsing, endpoint helpers (`fetchSlots`/`fetchMetrics`/`fetchV1Models`/`loadModel`), `detectMode`, `resolveContextSize`, load-wait state machine (`loadModelAndWait`), cached `ModelInspector`. No pi runtime dependency.
+- `metadata.ts` — per-server:model capability metadata (thinking style, context window) persisted to `llama-metadata.json`: debounced store, key migration + stale pruning, overlay application, lazy `/props` discovery
 - `thinking-style.ts` — pure style classification + tier parsing over /props data (no pi dependency)
 - `thinking.ts` — applies the discovered style to Pi model configs (level maps, compat kwargs) and decides `thinking_budget_tokens` injection
 - `ext-settings.ts` — loads/patches the `llama-link` namespace of `settings-ext.json` (defaults merge, corrupt-file auto-backup)
@@ -132,5 +133,5 @@ The `/llama-model` overlay shows per-server:
 
 ## Development
 
-- Tests: `npx vitest run` — pure modules only (`thinking-style`, `thinking`, `server`, `ext-settings`); the pi glue in `index.ts` is verified in a live session
+- Tests: `npx vitest run` — pure modules only (`thinking-style`, `thinking`, `server`, `metadata`, `ext-settings`); the pi glue in `index.ts` is verified in a live session
 - Run `pi --extension .../index.ts` and test the hooks and commands in a live session
