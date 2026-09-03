@@ -2,11 +2,15 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
-  ProviderModelConfig,
-  Theme,
 } from "@earendil-works/pi-coding-agent";
-import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 import { thinkingBudgetFor } from "./thinking";
+import { showStatus } from "./status";
+import {
+  startSseForServer,
+  stopSse,
+  isSseActive,
+  type SseGlue,
+} from "./sse";
 import {
   discoverModelMetadata,
   flushMetadataWrite,
@@ -16,7 +20,6 @@ import { patchExtSettings } from "./ext-settings";
 import { syncToModelsJson, flushModelsWrite } from "./sync";
 import {
   PROVIDER_NAME,
-  API_KEY_PLACEHOLDER,
   PROVIDER_IDS,
   rpc,
   loadSettings,
@@ -24,40 +27,16 @@ import {
   clearCaches,
   detectMode,
   resolveServers,
-  resolveApiKey,
   gatherServers,
   loadModelAndWait,
   ModelInspector,
   matchModel,
   isAutoExposedCacheEntry,
   parseSseStream,
-  type ServerConfig,
   type ServerInfo,
   type ServerMode,
-  type ModelsDataProperty,
   type ModelsResponse,
-  type MetricsData,
 } from "./server";
-
-// ── Pre-emption self-close ─────────────────────────────────────
-// A focused overlay renders on every TUI pass, but keyboard input routes to
-// the FOCUSED component — so when another UI (a consult/quiz/halter prompt,
-// a native selector, …) takes focus, this overlay would stay visible while
-// being impossible to dismiss. Render-time check: if we are visible but no
-// longer focused, close ourselves so the prompt underneath is reachable.
-// getFocusedComponent() is a TUI class method (used by pi's interactive mode)
-// that is NOT on the public TUI interface; if a future pi removes it, the
-// check is skipped and plain Esc/q close remains.
-function makePreemptClose(tui: any, self: unknown, done: () => void): boolean {
-  const getFocused = tui?.getFocusedComponent;
-  if (typeof getFocused !== "function") return false;
-  if (getFocused.call(tui) !== self) {
-    done();
-    return true; // pre-empted — caller should return [] for this frame
-  }
-  return false;
-}
-
 
 // ── Thinking Template Support ─────────────────────────────────────────
 // Style classification over /props data: thinking-style.ts.
@@ -80,204 +59,6 @@ function setLlamaStatus(ctx: ExtensionContext, value: string | undefined): void 
   if (value === lastLlamaStatus) return;
   lastLlamaStatus = value;
   try { ctx.ui.setStatus("llama", value); } catch { /* stale context */ }
-}
-
-// ── Status Indicator ──────────────────────────────────────────────────
-
-const STATUS_ICONS: Record<string, string> = {
-  loaded: "🟢",
-  loading: "🟡",
-  sleeping: "🔵",
-  unloaded: "⚪",
-  failed: "🔴",
-  offline: "⬛",
-};
-
-function buildBorderDynamic(theme: Theme, lines: string[], boxWidth: number): string[] {
-  const innerW = boxWidth - 2;
-  const pad = (s: string) => s + " ".repeat(Math.max(0, innerW - visibleWidth(s)));
-  const row = (content: string) =>
-    theme.fg("border", "│") + pad(` ${content}`) + theme.fg("border", "│");
-  const hr = () =>
-    theme.fg("border", "│") + theme.fg("dim", "─".repeat(innerW)) + theme.fg("border", "│");
-
-  const result: string[] = [];
-  result.push(theme.fg("border", `╭${"─".repeat(innerW)}╮`));
-  for (const line of lines) {
-    if (line === "---") result.push(hr());
-    else if (line === "") result.push(row(""));
-    else result.push(row(line));
-  }
-  result.push(theme.fg("border", `╰${"─".repeat(innerW)}╯`));
-  return result;
-}
-
-function formatParams(n: number | undefined): string {
-  if (!n) return "?";
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`;
-  return n.toString();
-}
-
-function formatBytes(bytes: number | undefined): string {
-  if (!bytes) return "?";
-  if (bytes >= 1_073_741_824) return `${(bytes / 1_073_741_824).toFixed(1)} GB`;
-  if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(0)} MB`;
-  return `${(bytes / 1024).toFixed(0)} KB`;
-}
-
-function formatMetrics(m: MetricsData): string[] {
-  const parts: string[] = [];
-  if (m.kv_cache_usage_ratio !== null) {
-    parts.push(`KV Cache: ${(m.kv_cache_usage_ratio * 100).toFixed(1)}%`);
-  }
-  if (m.kv_cache_tokens !== null) {
-    parts.push(`${m.kv_cache_tokens.toLocaleString()} cached`);
-  }
-  if (m.predicted_tokens_per_second !== null) {
-    parts.push(`Gen: ${m.predicted_tokens_per_second.toFixed(1)} tok/s`);
-  }
-  if (m.prompt_tokens_per_second !== null) {
-    parts.push(`Prefill: ${m.prompt_tokens_per_second.toFixed(1)} tok/s`);
-  }
-  if (m.requests_processing !== null && m.requests_processing > 0) {
-    parts.push(`${m.requests_processing} processing`);
-  }
-  if (m.requests_deferred !== null && m.requests_deferred > 0) {
-    parts.push(`${m.requests_deferred} deferred`);
-  }
-  return parts;
-}
-
-async function buildStatusLines(current: ProviderModelConfig | undefined): Promise<string[]> {
-  const serverInfo = await gatherServers();
-  const currentProvider = (current as any)?.provider;
-  const isLlamaModel = current && PROVIDER_IDS.includes(currentProvider);
-  const lines: string[] = [];
-
-  for (const { server, ready, models, mode } of serverInfo) {
-    if (lines.length > 0) lines.push("");
-    lines.push(`${server.name}${ready ? "" : " — ⬛ offline"}`);
-
-    if (!ready) continue;
-
-    const inspector = new ModelInspector(server, models.length > 0 ? { data: models, mode: mode! } : undefined);
-    const loadedModels = await inspector.loadedModels();
-
-    // Pi model ids may be aliases — match server models by id or alias
-    const isCurrent = (m: { id: string; aliases?: string[] }): boolean => {
-      if (!isLlamaModel || !current || currentProvider !== server.id) return false;
-      return matchModel(m, current.id);
-    };
-
-    loadedModels.sort((a, b) => Number(isCurrent(b)) - Number(isCurrent(a)));
-
-    if (loadedModels.length === 0) {
-      lines.push(`  ⚪ No model loaded`);
-    }
-
-    for (const serverModel of loadedModels) {
-      const { id, name, status } = serverModel;
-      const icon = STATUS_ICONS[status] || "⚪";
-      const contextSize = inspector.contextSize(id);
-      const caps = inspector.capabilities(id);
-      const isActive = isCurrent(serverModel);
-      const isSleeping = status === "sleeping";
-
-      lines.push(`  ${icon} ${name} (${status})${isActive ? " ✓ active" : ""}`);
-      lines.push(`     Context: ${contextSize.toLocaleString()} tokens · Input: ${caps.join(", ")}`);
-
-      // Skip live endpoints for sleeping models — they wake the model on the router
-      if (!isSleeping) {
-        const [meta, metrics] = await Promise.all([
-          inspector.getModelMeta(id),
-          inspector.getMetrics(mode === "router" ? id : undefined),
-          // Warm the slots cache so the sync getSlotInfo below can read it
-          inspector.getSlots(mode === "router" ? id : undefined),
-        ]);
-
-        if (meta) {
-          const parts: string[] = [];
-          if (meta.n_params) parts.push(`${formatParams(meta.n_params)} params`);
-          if (meta.n_vocab) parts.push(`${formatParams(meta.n_vocab)} vocab`);
-          if (meta.size) parts.push(`${formatBytes(meta.size)}`);
-          if (meta.n_ctx_train) parts.push(`Train ctx: ${meta.n_ctx_train.toLocaleString()}`);
-          if (parts.length) {
-            lines.push(`     ${parts.join(" · ")}`);
-          }
-        }
-
-        const slotInfo = inspector.getSlotInfo(mode === "router" ? id : undefined);
-        if (slotInfo.totalSlots > 0) {
-          const genInfo: string[] = [`${slotInfo.activeSlots}/${slotInfo.totalSlots} slots`];
-          if (slotInfo.decoded > 0) genInfo.push(`${slotInfo.decoded} tokens`);
-          if (slotInfo.remain > 0) genInfo.push(`${slotInfo.remain} remaining`);
-          lines.push(`     ▶ ${genInfo.join(" · ")}`);
-        }
-
-        const metricLines = formatMetrics(metrics);
-        if (metricLines.length) {
-          lines.push(`     📊 ${metricLines.join(" · ")}`);
-        }
-      }
-    }
-
-    const allModels = await inspector.list();
-    const filteredModels = allModels.filter((m) => !isAutoExposedCacheEntry(m));
-    if (filteredModels.length > 0) {
-      lines.push(`  Models:`);
-      for (const m of filteredModels) {
-        const status = await inspector.status(m.id);
-        const icon = STATUS_ICONS[status] || "⚪";
-        const name = m.aliases?.[0] || m.id;
-        const active = isCurrent(m) ? " ← active" : "";
-        lines.push(`    ${icon} ${name}${active}`);
-      }
-    }
-  }
-
-  return lines;
-}
-
-async function showStatus(ctx: ExtensionCommandContext): Promise<void> {
-  const contentLines = await buildStatusLines(ctx.model);
-
-  await ctx.ui.custom<void>(
-    (tui, theme, _keybindings, done) => {
-      const overlay = {
-        handleInput(data: string) {
-          if (matchesKey(data, "escape") || matchesKey(data, "q")) {
-            done(undefined);
-          }
-        },
-        render(width: number): string[] {
-          if (makePreemptClose(tui, overlay, () => done(undefined))) return [];
-          const overlayLines = [
-            theme.bold(theme.fg("accent", `${PROVIDER_NAME} Status`)),
-            "",
-            ...contentLines,
-            "",
-            "---",
-            "",
-            "Press Escape or q to close",
-          ];
-          return buildBorderDynamic(theme, overlayLines, width);
-        },
-        invalidate() {},
-      };
-      return overlay;
-    },
-    {
-      overlay: true,
-      overlayOptions: {
-        anchor: "center",
-        width: "80%",
-        minWidth: 70,
-        maxHeight: "90%",
-      },
-    },
-  );
 }
 
 // ── Unload Command ────────────────────────────────────────────────────
@@ -436,278 +217,6 @@ async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Pro
   }
 }
 
-// ── SSE Model Loading Progress ────────────────────────────────────────
-
-interface SseProgress {
-  current?: string;    // "text_model", "spec_model", "mmproj_model"
-  stage?: string;      // older format: single stage name
-  value?: number;      // 0.0 — 1.0
-}
-
-interface ModelLoadState {
-  status: string;      // "loading", "loaded", "sleeping", "unloaded"
-  progress?: SseProgress;
-}
-
-let sseAbort: AbortController | null = null;
-let sseServerId: string | "" = "";
-let sseCtx: ExtensionContext | null = null;
-let sseReconnectTimer: NodeJS.Timeout | null = null;
-let sseReconnectAttempts = 0;
-let sseClearToken = 0;
-const SSE_MAX_RECONNECT_ATTEMPTS = 10;
-const SSE_INITIAL_RECONNECT_MS = 1000;
-
-const STAGE_LABELS: Record<string, string> = {
-  "fit_params": "fitting params",
-  "text_model": "model",
-  "mmproj_model": "mmproj",
-};
-
-function formatStage(stage: string): string {
-  return STAGE_LABELS[stage] || stage;
-}
-
-/**
- * Format the loading progress string for the status bar.
- * Matches tps/gallop style: dim prefix, accent for key values, dim for detail.
- */
-function formatLoadingProgress(state: ModelLoadState, theme: any): string {
-  const dim = (s: string) => theme.fg("dim", s);
-  const accent = (s: string) => theme.fg("accent", s);
-  const success = (s: string) => theme.fg("success", s);
-
-  if (state.status === "loading" && state.progress) {
-    const prog = state.progress;
-    const stage = prog.current || prog.stage;
-    const value = prog.value;
-
-    if (stage && value !== undefined) {
-      const pct = Math.round(value * 100);
-      if (stage === "fit_params") {
-        return `${dim("· ")}${accent("Loading")} ${dim(`${formatStage(stage)}...`)}`;
-      }
-      return `${dim("· ")}${accent("Loading")} ${dim(`${formatStage(stage)} ${pct}%`)}`;
-    }
-  }
-
-  if (state.status === "loading") {
-    return `${dim("· ")}${accent("Loading")} ${dim("...")}`;
-  }
-
-  if (state.status === "loaded") {
-    return `${success("✓")} ${dim("loaded")}`;
-  }
-
-  return "";
-}
-
-/**
- * Parse SSE stream from a Response body.
- * Yields parsed JSON objects from "data:" lines.
- */
-async function* parseSseStream(response: Response): AsyncGenerator<string> {
-  if (!response.body) return;
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop() || "";
-
-      for (const part of parts) {
-        const lines = part.split("\n");
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith("data:")) {
-            const json = trimmed.slice(5).trim();
-            if (json) yield json;
-          }
-        }
-      }
-    }
-
-    if (buffer.trim()) {
-      const lines = buffer.split("\n");
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("data:")) {
-          const json = trimmed.slice(5).trim();
-          if (json) yield json;
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-/**
- * Connect to /models/sse and process status_change events.
- * Reconnects with exponential backoff on disconnect (up to max attempts).
- */
-async function connectSse(
-  server: ServerConfig,
-  ctx: ExtensionContext,
-): Promise<void> {
-  const apiKey = resolveApiKey(server.id);
-  const url = `${server.url}/models/sse`;
-
-  sseAbort = new AbortController();
-  sseCtx = ctx;
-  sseServerId = server.id;
-
-  try {
-    const response = await fetch(url, {
-      headers: {
-        "Accept": "text/event-stream",
-        ...(apiKey && apiKey !== API_KEY_PLACEHOLDER
-          ? { Authorization: `Bearer ${apiKey}` }
-          : {}),
-      },
-      signal: sseAbort.signal,
-    });
-
-    if (!response.ok) {
-      // SSE endpoint not available (e.g., single-model mode or old server)
-      stopSse();
-      return;
-    }
-
-    sseReconnectAttempts = 0;
-
-    for await (const jsonStr of parseSseStream(response)) {
-      try {
-        const event = JSON.parse(jsonStr);
-        handleSseEvent(event, server.id, ctx);
-      } catch {
-        // Skip malformed SSE data lines
-      }
-    }
-  } catch (err: any) {
-    const msg = err?.name || err?.message || String(err);
-    // AbortError is expected when we intentionally disconnect
-    if (msg === "AbortError" || msg === "aborted") return;
-
-    attemptSseReconnect(server, ctx);
-  }
-}
-
-/**
- * Attempt to reconnect SSE with exponential backoff.
- */
-function attemptSseReconnect(
-  server: ServerConfig,
-  ctx: ExtensionContext,
-): void {
-  if (sseReconnectAttempts >= SSE_MAX_RECONNECT_ATTEMPTS) {
-    stopSse(); // Clear stale state so isSseActive() returns false
-    return;
-  }
-
-  sseReconnectAttempts++;
-  const delay = Math.min(
-    SSE_INITIAL_RECONNECT_MS * Math.pow(2, sseReconnectAttempts - 1),
-    30000, // Cap at 30s
-  );
-
-  sseReconnectTimer = setTimeout(() => {
-    connectSse(server, ctx);
-  }, delay);
-}
-
-/**
- * Handle a parsed SSE data line.
- * SSE format: data: {"model":"...","event":"status_change","data":{"status":"loading","progress":{...}}}
- * The JSON has: model, event, data (with status + progress inside).
- */
-function handleSseEvent(
-  payload: any,
-  serverId: string,
-  ctx: ExtensionContext,
-): void {
-  if (!payload || !payload.model) return;
-
-  const inner = payload.data;
-  if (!inner || !inner.status) return;
-
-  const status = inner.status;
-  const progress = inner.progress;
-
-  const state: ModelLoadState = {
-    status,
-    progress: progress || undefined,
-  };
-  // Update status bar if this model belongs to the active server
-  if (serverId === sseServerId && sseCtx) {
-    try {
-      const theme = ctx.ui.theme;
-      const progressStr = formatLoadingProgress(state, theme);
-      if (progressStr) {
-        setLlamaStatus(ctx, progressStr);
-      }
-
-      // Clear status bar when model is fully loaded.
-      // Token guard: a newer loading event increments sseClearToken,
-      // so a stale 5s timer won't clobber the freshly-set status.
-      if (status === "loaded") {
-        const token = ++sseClearToken;
-        setTimeout(() => {
-          if (sseCtx && token === sseClearToken) setLlamaStatus(sseCtx, undefined);
-        }, 5000);
-      }
-    } catch {
-      // Context may be stale after session end
-    }
-  }
-}
-
-/**
- * Stop the active SSE connection and clear state.
- */
-function stopSse(): void {
-  if (sseReconnectTimer) {
-    clearTimeout(sseReconnectTimer);
-    sseReconnectTimer = null;
-  }
-  if (sseAbort) {
-    sseAbort.abort();
-    sseAbort = null;
-  }
-  sseServerId = "";
-  sseReconnectAttempts = 0;
-  sseClearToken = 0;
-}
-
-/**
- * Start SSE listener for a server if not already connected.
- */
-function startSseForServer(serverId: string, ctx: ExtensionContext): void {
-  if (sseServerId === serverId) return;
-
-  stopSse();
-
-  const servers = resolveServers();
-  const server = servers.find((s) => s.id === serverId);
-  if (!server) return;
-
-  connectSse(server, ctx);
-}
-
-/**
- * Check if SSE is connected to a llama-cpp provider.
- */
-function isSseActive(): boolean {
-  return sseServerId !== "" && PROVIDER_IDS.includes(sseServerId);
-}
-
 // ── Session-start notice ──────────────────────────────────────────────
 
 /**
@@ -757,6 +266,14 @@ async function announceLoadedModels(serverInfo: ServerInfo[], ctx: ExtensionCont
 
 // ── Extension Entry ───────────────────────────────────────────────────
 
+// Pi-glue for the SSE status bar (sse.ts): stale-safe theme + status access.
+const sseGlue: SseGlue = {
+  getTheme: (ctx) => {
+    try { return (ctx as ExtensionContext).ui.theme; } catch { return undefined; }
+  },
+  setStatus: (ctx, value) => setLlamaStatus(ctx as ExtensionContext, value),
+};
+
 export default function llamaLinkExtension(pi: ExtensionAPI) {
   pi.registerCommand("llama-model", {
     description: `${PROVIDER_NAME} status indicator`,
@@ -804,7 +321,7 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     if (!isLlamaStatusEnabled()) return;
     const provider = (ctx.model as any)?.provider;
     if (provider && PROVIDER_IDS.includes(provider) && !isSseActive()) {
-      startSseForServer(provider, ctx);
+      startSseForServer(provider, ctx, sseGlue);
     }
   });
 
@@ -816,14 +333,13 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
       return;
     }
 
-    if (isSseActive() && sseServerId === provider) return;
+    if (isSseActive(provider)) return;
 
-    startSseForServer(provider, ctx);
+    startSseForServer(provider, ctx, sseGlue);
   });
 
   pi.on("session_shutdown", async () => {
     stopSse();
-    sseCtx = null;
     // Flush pending debounced writes before clearing
     flushModelsWrite();
     flushMetadataWrite();

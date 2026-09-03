@@ -377,6 +377,17 @@ export async function* parseSseStream(response: Response): AsyncGenerator<string
         }
       }
     }
+
+    if (buffer.trim()) {
+      const lines = buffer.split("\n");
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("data:")) {
+          const json = trimmed.slice(5).trim();
+          if (json) yield json;
+        }
+      }
+    }
   } finally {
     reader.releaseLock();
   }

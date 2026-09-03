@@ -23,6 +23,38 @@ afterAll(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
+describe("parseSseStream", () => {
+  const streamOf = (chunks: string[]) =>
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        const enc = new TextEncoder();
+        for (const c of chunks) controller.enqueue(enc.encode(c));
+        controller.close();
+      },
+    });
+
+  it("reassembles events split across chunks", async () => {
+    const res = new Response(streamOf(['data: {"a":1}\n\nda', 'ta: {"b":2}\n\n']));
+    const out: string[] = [];
+    for await (const s of server.parseSseStream(res)) out.push(s);
+    expect(out).toEqual(['{"a":1}', '{"b":2}']);
+  });
+
+  it("flushes a final event without a trailing blank line", async () => {
+    const res = new Response(streamOf(['data: {"a":1}\n\ndata: {"b":2}\n']));
+    const out: string[] = [];
+    for await (const s of server.parseSseStream(res)) out.push(s);
+    expect(out).toEqual(['{"a":1}', '{"b":2}']);
+  });
+
+  it("no body → yields nothing", async () => {
+    const res = new Response(null);
+    const out: string[] = [];
+    for await (const s of server.parseSseStream(res)) out.push(s);
+    expect(out).toEqual([]);
+  });
+});
+
 describe("extractError", () => {
   it("pulls llama.cpp error.message", () => {
     expect(server.extractError({ error: { code: 400, message: "model not found" } }, "fb")).toBe(
