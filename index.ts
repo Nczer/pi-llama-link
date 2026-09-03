@@ -164,18 +164,6 @@ const QWEN_THINKING_LEVEL_MAP = {
   max: "on",
 } satisfies NonNullable<ProviderModelConfig["thinkingLevelMap"]>;
 
-// DeepSeek-style: chat_template_kwargs.thinking (effort string).
-// Maps every Pi level to a distinct effort value via chatTemplateKwargs.
-const CHAT_TEMPLATE_THINKING_LEVEL_MAP = {
-  off: null,
-  minimal: null,
-  low: "low",
-  medium: null,
-  high: "high",
-  xhigh: null,
-  max: "max",
-} satisfies NonNullable<ProviderModelConfig["thinkingLevelMap"]>;
-
 // Effort style (reasoning_effort / reasoning_strength): per-model level maps
 // and tier parsing live in thinking-style.ts, populated from /props discovery.
 
@@ -190,19 +178,6 @@ function applyEnableThinkingSupport(model: Record<string, any>): void {
     chatTemplateKwargs: {
       "enable_thinking": { "$var": "thinking.enabled" },
       "preserve_thinking": true,
-    },
-  };
-}
-
-// Apply chat-template style thinking (thinking effort string + chatTemplateKwargs).
-function applyChatTemplateThinkingSupport(model: Record<string, any>): void {
-  model.reasoning = true;
-  model.thinkingLevelMap = CHAT_TEMPLATE_THINKING_LEVEL_MAP;
-  model.compat = {
-    ...model.compat,
-    thinkingFormat: "chat-template",
-    chatTemplateKwargs: {
-      "thinking": { "$var": "thinking.effort", omitWhenOff: true },
     },
   };
 }
@@ -1566,7 +1541,7 @@ function isSseActive(): boolean {
 // Persists model capabilities (thinking, context size) per server:model so it survives model syncs.
 
 interface ModelMetadataEntry {
-  thinking?: "effort" | "chat-template" | "toggle";
+  thinking?: "effort" | "toggle";
   effortLevels?: string[];
   effortAliases?: Record<string, string>;
   effortOff?: boolean;
@@ -1658,9 +1633,6 @@ function applyMetadataOverlay(model: Record<string, any>, serverId: string, over
   if (!entry) return;
   if (entry.thinking) {
     switch (entry.thinking) {
-      case "chat-template":
-        applyChatTemplateThinkingSupport(model);
-        break;
       case "effort":
         applyEffortThinkingSupport(model, {
           levels: entry.effortLevels,

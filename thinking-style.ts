@@ -5,10 +5,13 @@
  * no pi or server dependencies — kept separate so it can be unit-tested.
  *
  * Style priority:
- *   1. "effort"         — template consumes reasoning_effort / reasoning_strength
- *                         (effort string; server binds one value to both names)
- *   2. "chat-template"  — DeepSeek-style `{{ thinking }}` variable
- *   3. "toggle"         — enable_thinking boolean toggle only
+ *   1. "effort" — template consumes reasoning_effort / reasoning_strength
+ *                  (effort string; server binds one value to both names)
+ *   2. "toggle" — enable_thinking boolean toggle only
+ *
+ * Note: real DeepSeek templates gate on `thinking` in `{% if ... %}` form and
+ * are classified as toggle (V3.1) or effort (V4+, via reasoning_effort) —
+ * they never reference `{{ thinking }}`, so no dedicated style is needed.
  *
  * Tiers (which effort levels a model honors) are NOT exposed by the API.
  * Strict templates self-document and are parsed:
@@ -48,7 +51,7 @@ export interface EffortStyle {
 }
 
 export interface ThinkingStyle {
-  style: "effort" | "chat-template" | "toggle" | "none";
+  style: "effort" | "toggle" | "none";
   effort?: EffortStyle;
 }
 
@@ -131,7 +134,6 @@ export function classifyThinkingStyle(data: {
     return { style: "effort", effort: parseEffortTemplate(ct) };
   }
 
-  if (/\{[%{]\s*thinking\b/.test(ct)) return { style: "chat-template" };
   if (ct.includes("enable_thinking")) return { style: "toggle" };
   return { style: "none" };
 }

@@ -41,7 +41,7 @@ describe("classifyThinkingStyle", () => {
     expect(classifyThinkingStyle({ chat_template: ct }).style).toBe("toggle");
   });
 
-  it("does not treat bare `{% if thinking %}` references as chat-template", () => {
+  it("bare `{% if thinking %}` references classify as none (no chat-template style)", () => {
     expect(classifyThinkingStyle({ chat_template: "{% if thinking %}" }).style).toBe("none");
   });
 

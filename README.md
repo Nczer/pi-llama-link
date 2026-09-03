@@ -74,12 +74,13 @@ The `session_start` sync reuses a single `/models` fetch per server for both syn
 
 Autodetects thinking capability from each model's chat template via `/props` (`chat_template` + `chat_template_caps`), classified in `thinking-style.ts`:
 
-- **effort style** (Qwen3.8, Muse Glimmer, etc.) — template consumes `reasoning_effort` and/or `reasoning_strength` (detected via the `supports_reasoning_effort` cap; template-text fallback for older builds). Only the variable name(s) the template actually references are emitted as `chatTemplateKwargs` keys (each bound to the same effort string); caps-only detection (no template text) falls back to emitting both names. Exposed levels are per-model: every exposed level maps to a distinct model tier, levels with no effect are hidden (never clamped).
+- **effort style** (Qwen3.8, Muse Glimmer, DeepSeek V4, etc.) — template consumes `reasoning_effort` and/or `reasoning_strength` (detected via the `supports_reasoning_effort` cap; template-text fallback for older builds). Only the variable name(s) the template actually references are emitted as `chatTemplateKwargs` keys (each bound to the same effort string); caps-only detection (no template text) falls back to emitting both names. Exposed levels are per-model: every exposed level maps to a distinct model tier, levels with no effect are hidden (never clamped).
   - **Strict templates** self-document tiers and are parsed from the template: `not in ('xhigh', 'medium', 'low')` → level list, `raise_exception('... Supported types are ...')` → fallback, `== 'high' → set 'xhigh'` → alias (e.g. Qwen3.8 exposes off/low/medium/xhigh).
   - **Free-form templates** (Muse Glimmer, etc.) validate nothing → generic set low/medium/high/xhigh.
   - `off` is exposed only when the template gates on `enable_thinking` (`none` disables reasoning server-side).
-- **thinking variable style** (DeepSeek, etc.) → effort string via `chatTemplateKwargs.thinking`, `thinkingFormat: "chat-template"`. Levels low/high/max exposed.
-- **enable_thinking toggle** (Gemma4, etc.) → boolean toggle via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Levels off/low/high/max exposed; budget tokens differentiate low vs high.
+- **enable_thinking toggle** (Gemma4, DeepSeek V3.1, etc.) → boolean toggle via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Levels off/low/high/max exposed; budget tokens differentiate low vs high.
+
+DeepSeek templates gate on `thinking` in `{% if ... %}` form (never `{{ thinking }}`), so they land in the two styles above: V3.1 as toggle, V4+ as effort.
 
 `thinking_budget_tokens` is injected for a subset of levels (`low` → 512, `high` → 8192); `medium` is intentionally unmapped and falls back to the server's default budget.
 
