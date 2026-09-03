@@ -6,7 +6,12 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
-import { classifyThinkingStyle, buildEffortLevelMap, type EffortStyle } from "./thinking-style";
+import { classifyThinkingStyle } from "./thinking-style";
+import {
+  applyEnableThinkingSupport,
+  applyEffortThinkingSupport,
+  thinkingBudgetFor,
+} from "./thinking";
 import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { loadExtSettings, patchExtSettings } from "./ext-settings";
@@ -136,70 +141,8 @@ interface ModelsJson {
 }
 
 // ── Thinking Template Support ─────────────────────────────────────────
-
-// Thinking budget (tokens) mapped from Pi thinking levels.
-// Injected as thinking_budget_tokens in the request body for llama-cpp providers.
-// off: no budget injection (thinking disabled)
-// max: unrestricted (server default -1, no budget injection)
-// Only a few tiers are mapped on purpose; unmapped levels (e.g. medium)
-// intentionally fall back to the server's default budget (no injection).
-const THINKING_BUDGET_MAP: Record<string, number | undefined> = {
-  off: undefined,
-  low: 512,
-  high: 8192,
-  max: undefined,
-};
-
-// Qwen-style: chat_template_kwargs.enable_thinking (boolean toggle).
-// Pi's qwen-chat-template format sends enable_thinking based on reasoning effort.
-// String values expose levels in UI; Pi sends enable_thinking: false for off level.
-// Granularity is controlled by thinking_budget_tokens injection in before_provider_request hook.
-const QWEN_THINKING_LEVEL_MAP = {
-  off: "off",
-  minimal: null,
-  low: "on",
-  medium: null,
-  high: "on",
-  xhigh: null,
-  max: "on",
-} satisfies NonNullable<ProviderModelConfig["thinkingLevelMap"]>;
-
-// Effort style (reasoning_effort / reasoning_strength): per-model level maps
-// and tier parsing live in thinking-style.ts, populated from /props discovery.
-
-// Apply enable_thinking thinking (boolean toggle via chat_template_kwargs).
-// Generic Jinja variable — works for Qwen, Gemma4, or any template that reads enable_thinking.
-function applyEnableThinkingSupport(model: Record<string, any>): void {
-  model.reasoning = true;
-  model.thinkingLevelMap = QWEN_THINKING_LEVEL_MAP;
-  model.compat = {
-    ...model.compat,
-    thinkingFormat: "chat-template",
-    chatTemplateKwargs: {
-      "enable_thinking": { "$var": "thinking.enabled" },
-      "preserve_thinking": true,
-    },
-  };
-}
-
-// Apply effort-style thinking support (reasoning_effort / reasoning_strength effort string).
-// Emit only the variable names the template actually references (parsed from the
-// template text); fall back to both names when detection was caps-only (no text).
-// Off → "none" (server disables reasoning), only when the template
-// gates on enable_thinking — otherwise off is hidden (channel has no off path).
-function applyEffortThinkingSupport(model: Record<string, any>, effort: EffortStyle): void {
-  model.reasoning = true;
-  model.thinkingLevelMap = buildEffortLevelMap(effort);
-  const effortVars = effort.varNames ?? ["reasoning_effort", "reasoning_strength"];
-  model.compat = {
-    ...model.compat,
-    thinkingFormat: "chat-template",
-    chatTemplateKwargs: {
-      ...(effort.off ? { "enable_thinking": { "$var": "thinking.enabled" } } : {}),
-      ...Object.fromEntries(effortVars.map((name) => [name, { "$var": "thinking.effort" }])),
-    },
-  };
-}
+// Style classification over /props data: thinking-style.ts.
+// Config + payload application: thinking.ts.
 
 // ── Config Resolution ─────────────────────────────────────────────────
 
@@ -1889,15 +1832,7 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     if (!isLlamaStatusEnabled()) return;
     const provider = (ctx.model as any)?.provider;
     if (!PROVIDER_IDS.includes(provider || "")) return;
-    if (!(ctx.model as any)?.reasoning) return;
-
-    // Effort-style models (Muse/Qwen) consume reasoning_effort/reasoning_strength,
-    // not thinking_budget_tokens
-    const kwargs = (ctx.model as any)?.compat?.chatTemplateKwargs;
-    if (kwargs?.reasoning_effort || kwargs?.reasoning_strength) return;
-
-    const level = pi.getThinkingLevel();
-    const budget = THINKING_BUDGET_MAP[level];
+    const budget = thinkingBudgetFor(ctx.model, pi.getThinkingLevel());
     if (budget === undefined) return;
 
     return {

@@ -97,6 +97,7 @@ Discovered metadata (style + parsed tiers/aliases) is persisted to `llama-metada
 - `ModelInspector.status(id)` — router: from `/models` data; single: from `/props`. Returns `loaded|loading|sleeping|unloaded|failed`
 - `resolveContextSize(model)` — router: parses `--ctx-size`/`-c`/`-ctx`/`--fit-ctx` from `status.args`; single: `meta.n_ctx`, then `n_ctx_train`. Fallback: 32768.
 - `thinking-style.ts` — pure style classification + tier parsing over /props data (no pi dependency)
+- `thinking.ts` — applies the discovered style to Pi model configs (level maps, compat kwargs) and decides `thinking_budget_tokens` injection
 - `buildStatusLines(current)` — gathers all data, returns plain string lines
 - `buildBorderDynamic(theme, lines, width)` — wraps lines in box-drawing border using `visibleWidth()` for emoji-safe padding
 
