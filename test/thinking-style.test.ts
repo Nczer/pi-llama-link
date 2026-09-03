@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   classifyThinkingStyle,
   parseEffortTemplate,
+  extractEffortLiterals,
   buildEffortLevelMap,
   GENERIC_EFFORT_LEVELS,
 } from "../thinking-style";
@@ -100,6 +101,119 @@ describe("parseEffortTemplate", () => {
     expect(GENERIC_EFFORT_LEVELS).toEqual(["low", "medium", "high", "xhigh"]);
   });
 });
+
+describe("parseEffortTemplate — template-derived level sets (live template shapes)", () => {
+  it("DeepSeek V4: only `== 'max'` → [max], off via enable_thinking gate → none",
+    () => {
+      const ct = [
+        "{%- if enable_thinking is defined -%}",
+        "  {%- set thinking = enable_thinking -%}",
+        "{%- endif -%}",
+        "...",
+        "{%- if messages and thinking and reasoning_effort is defined and reasoning_effort == 'max' -%}",
+        "  max header",
+        "{%- endif -%}",
+      ].join("\n");
+      const e = parseEffortTemplate(ct);
+      expect(e.levels).toEqual(["max"]);
+      expect(e.offToken).toBeUndefined();
+      expect(e.off).toBe(true);
+    });
+
+  it("DeepSeek V4-Flash: `== 'high'` and `== 'max'` → [high, max]",
+    () => {
+      const ct = [
+        "{%- if messages and thinking and reasoning_effort is defined and reasoning_effort == 'high' -%}",
+        "  high header",
+        "{%- elif messages and thinking and reasoning_effort is defined and reasoning_effort == 'max' -%}",
+        "  max header",
+        "{%- endif -%}",
+      ].join("\n");
+      expect(parseEffortTemplate(ct).levels).toEqual(["high", "max"]);
+    });
+
+  it("tencent Hy3: not-in tuple + no_think → [high, low], offToken no_think",
+    () => {
+      const ct = [
+        "{%- if not reasoning_effort is defined %}",
+        "    {%- set reasoning_effort = 'no_think' %}",
+        "{%- elif reasoning_effort not in ['high', 'low', 'no_think'] %}",
+        "    raise",
+        "{%- endif %}",
+        "...",
+        "{%- if reasoning_effort in ['low', 'high'] %}...{%- endif %}",
+      ].join("\n");
+      const e = parseEffortTemplate(ct);
+      expect(e.levels).toEqual(["high", "low"]);
+      expect(e.offToken).toBe("no_think");
+      expect(e.off).toBe(false); // no enable_thinking gate
+    });
+
+  it("upstage Solar: in-list + conditional default → [low, minimal, high], no off",
+    () => {
+      const ct = [
+        "{%- set reasoning_effort = reasoning_effort if reasoning_effort is defined else \"high\" %}",
+        "...",
+        "    {%- if reasoning_effort in [\"low\", \"minimal\"] -%}",
+        "...",
+      ].join("\n");
+      const e = parseEffortTemplate(ct);
+      expect(e.levels).toEqual(["low", "minimal", "high"]);
+      expect(e.offToken).toBeUndefined();
+    });
+
+  it("Cohere2MoE: `== \"none\"` only → levels [], offToken none (only off expressible)",
+    () => {
+      const ct = '{%- set reasoning = reasoning if reasoning is not undefined else (false if reasoning_effort is defined and reasoning_effort | lower == "none" else true) -%}';
+      const e = parseEffortTemplate(ct);
+      expect(e.levels).toEqual([]);
+      expect(e.offToken).toBe("none");
+    });
+
+  it("gpt-oss: interpolated free-form with default → generic (levels undefined)",
+    () => {
+      const ct = [
+        "- \"reasoning_effort\": A string that describes the reasoning effort, defaults to \"medium\".",
+        "    {%- if reasoning_effort is not defined %}",
+        '        {%- set reasoning_effort = "medium" %}',
+        "    {%- endif %}",
+        '    {{- "Reasoning: " + reasoning_effort + "\\n\\n" }}',
+      ].join("\n");
+      expect(parseEffortTemplate(ct).levels).toBeUndefined();
+    });
+
+  it("extractEffortLiterals: no references → undefined", () => {
+    expect(extractEffortLiterals("{% if x %}")).toBeUndefined();
+  });
+});
+
+describe("buildEffortLevelMap — template-derived exposure",
+  () => {
+    it("V4 shape: only max + off(none) exposed", () => {
+      const map = buildEffortLevelMap({ levels: ["max"], off: true, varNames: ["reasoning_effort"] });
+      expect(Object.fromEntries(Object.entries(map).filter(([, v]) => v !== null)))
+        .toEqual({ off: "none", max: "max" });
+    });
+
+    it("Hy3 shape: off maps to the template's no_think token", () => {
+      const map = buildEffortLevelMap({ levels: ["high", "low"], off: false, offToken: "no_think" });
+      expect(map.off).toBe("no_think");
+      expect(map.low).toBe("low");
+      expect(map.high).toBe("high");
+      expect(map.medium).toBeNull();
+      expect(map.xhigh).toBeNull();
+    });
+
+    it("off-token alone exposes off even without an enable_thinking gate", () => {
+      expect(buildEffortLevelMap({ levels: [], off: false, offToken: "none" }).off).toBe("none");
+    });
+
+    it("levels [] hides everything except off", () => {
+      const map = buildEffortLevelMap({ levels: [], off: true });
+      const exposed = Object.fromEntries(Object.entries(map).filter(([, v]) => v !== null));
+      expect(exposed).toEqual({ off: "none" });
+    });
+  });
 
 describe("buildEffortLevelMap", () => {
   const base = () => ({ off: false, varNames: ["reasoning_effort"] });

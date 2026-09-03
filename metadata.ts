@@ -31,6 +31,8 @@ export interface ModelMetadataEntry {
   effortLevels?: string[];
   effortAliases?: Record<string, string>;
   effortOff?: boolean;
+  /** Off-token in the template's effort vocabulary (none/off/no_think). */
+  effortOffToken?: string;
   contextWindow?: number;
 }
 
@@ -145,6 +147,7 @@ export function applyMetadataOverlay(model: Record<string, any>, serverId: strin
           levels: entry.effortLevels,
           aliases: entry.effortAliases,
           off: entry.effortOff === true,
+          offToken: entry.effortOffToken,
         });
         break;
       case "toggle":
@@ -224,6 +227,7 @@ export async function discoverModelMetadata(
         if (style.effort.levels) metadata.effortLevels = style.effort.levels;
         if (style.effort.aliases) metadata.effortAliases = style.effort.aliases;
         metadata.effortOff = style.effort.off;
+        if (style.effort.offToken) metadata.effortOffToken = style.effort.offToken;
       }
       updated = true;
     }

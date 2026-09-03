@@ -76,10 +76,11 @@ The `session_start` sync reuses a single `/models` fetch per server for both syn
 
 Autodetects thinking capability from each model's chat template via `/props` (`chat_template` + `chat_template_caps`), classified in `thinking-style.ts`:
 
-- **effort style** (Qwen3.8, Muse Glimmer, DeepSeek V4, etc.) — template consumes `reasoning_effort` and/or `reasoning_strength` (detected via the `supports_reasoning_effort` cap; template-text fallback for older builds). Only the variable name(s) the template actually references are emitted as `chatTemplateKwargs` keys (each bound to the same effort string); caps-only detection (no template text) falls back to emitting both names. Exposed levels are per-model: every exposed level maps to a distinct model tier, levels with no effect are hidden (never clamped).
-  - **Strict templates** self-document tiers and are parsed from the template: `not in ('xhigh', 'medium', 'low')` → level list, `raise_exception('... Supported types are ...')` → fallback, `== 'high' → set 'xhigh'` → alias (e.g. Qwen3.8 exposes off/low/medium/xhigh).
-  - **Free-form templates** (Muse Glimmer, etc.) validate nothing → generic set low/medium/high/xhigh.
-  - `off` is exposed only when the template gates on `enable_thinking` (`none` disables reasoning server-side).
+- **effort style** (Qwen3.8, Muse Glimmer, DeepSeek V4, etc.) — template consumes `reasoning_effort` and/or `reasoning_strength` (detected via the `supports_reasoning_effort` cap; template-text fallback for older builds). Only the variable name(s) the template actually references are emitted as `chatTemplateKwargs` keys (each bound to the same effort string); caps-only detection (no template text) falls back to emitting both names.
+  - **Only levels the template actually distinguishes are exposed** (never clamped). The tier set is parsed from the template's own effort usage: `== 'v'` / `!= 'v'` / `in [...]` / `not in [...]` comparisons, plus `set reasoning_effort = 'v'` / `else 'v'` defaults. E.g. DeepSeek V4 (checks only `== 'max'`) exposes off/max, V4-Flash off/high/max, tencent Hy3 off→`no_think`/low/high, upstage Solar minimal/low/high, Cohere2MoE off only.
+  - **Free-form templates** (gpt-oss, Muse Glimmer — effort string interpolated into the prompt, no comparables) get the generic set low/medium/high/xhigh.
+  - Heuristic fallbacks for templates whose comparisons don't fit the scoped patterns (e.g. Qwen3.8 compares an alias variable `resolved_reasoning_effort`): unscoped `not in ('xhigh', 'medium', 'low')` tuple, then the `raise_exception('... Supported types are ...')` message.
+  - `off` is exposed when the template gates on `enable_thinking` (payload `none`) or names an off-token in its effort vocabulary (`none`/`off`/`no_think`), which becomes the payload value for off.
 - **enable_thinking toggle** (Gemma4, DeepSeek V3.1, etc.) → boolean toggle via `chatTemplateKwargs`, `thinkingFormat: "chat-template"`. Levels off/low/high/max exposed; budget tokens differentiate low vs high.
 
 DeepSeek templates gate on `thinking` in `{% if ... %}` form (never `{{ thinking }}`), so they land in the two styles above: V3.1 as toggle, V4+ as effort.
@@ -95,7 +96,7 @@ Discovered metadata (style + parsed tiers/aliases) is persisted to `llama-metada
 - `index.ts` — pi glue: hooks, commands, TUI (status overlay, SSE loading indicator), metadata overlay + sync orchestration
 - `server.ts` — server layer: server resolution + per-server auth, `rpc()` JSON client + SSE stream parsing, endpoint helpers (`fetchSlots`/`fetchMetrics`/`fetchV1Models`/`loadModel`), `detectMode`, `resolveContextSize`, load-wait state machine (`loadModelAndWait`), cached `ModelInspector`. No pi runtime dependency.
 - `metadata.ts` — per-server:model capability metadata (thinking style, context window) persisted to `llama-metadata.json`: debounced store, key migration + stale pruning, overlay application, lazy `/props` discovery
-- `thinking-style.ts` — pure style classification + tier parsing over /props data (no pi dependency)
+- `thinking-style.ts` — pure style classification + template-derived tier exposure over /props data (no pi dependency)
 - `thinking.ts` — applies the discovered style to Pi model configs (level maps, compat kwargs) and decides `thinking_budget_tokens` injection
 - `sync.ts` — `models.json` sync: alias-based ids (`resolveApiIds`), change detection, debounced write + flush, stale-provider pruning; applies the metadata overlay per model
 - `sse.ts` — persistent `/models/sse` listener: loading-progress status bar with exponential-backoff reconnect; all pi access via injected `SseGlue`

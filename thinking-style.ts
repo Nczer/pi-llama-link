@@ -13,12 +13,19 @@
  * are classified as toggle (V3.1) or effort (V4+, via reasoning_effort) —
  * they never reference `{{ thinking }}`, so no dedicated style is needed.
  *
- * Tiers (which effort levels a model honors) are NOT exposed by the API.
- * Strict templates self-document and are parsed:
- *   not in ('xhigh', 'medium', 'low')                → level list
- *   raise_exception('... Supported types are ...')   → level list (fallback)
+ * Tier exposure: only levels the chat template actually distinguishes are
+ * exposed. Tiers are parsed from the template's own reasoning_effort /
+ * reasoning_strength usage (line-scoped):
+ *   == 'v' / != 'v' / in [...] / not in [...]          → level (or off-token)
+ *   set reasoning_effort = 'v' / else 'v'              → default level
+ *   effort concatenated into the prompt, no comparables → free-form → generic
+ * Heuristic fallbacks for templates whose comparisons don't fit the above:
+ *   not in ('xhigh', 'medium', 'low')  (unscoped)      → level list
+ *   raise_exception('... Supported types are ...')     → level list
+ * Off is exposed when the template gates on enable_thinking (→ "none") or
+ * names an off-token in its effort vocabulary (none/off/no_think).
+ * Aliases:
  *   if x == 'high' → set x = 'xhigh'                 → alias
- * Free-form templates (e.g. Muse Glimmer) validate nothing → generic set.
  */
 
 /** Pi thinking levels in display order. */
@@ -35,13 +42,21 @@ const EFFORT_VOCABULARY = new Set([
   "minimal", "low", "medium", "high", "xhigh", "max", "none", "off", "on",
 ]);
 
+/** Effort-vocabulary values that mean "thinking off" in the template. */
+const OFF_TOKENS = new Set(["none", "off", "no_think"]);
+
 export interface EffortStyle {
-  /** Parsed valid tiers; undefined → generic set. */
+  /** Parsed valid tiers; undefined → generic set; [] → none beyond off. */
   levels?: string[];
   /** Template aliases, e.g. { high: "xhigh" }. */
   aliases?: Record<string, string>;
-  /** Template gates on enable_thinking → "off" is expressible. */
+  /** Template gates on enable_thinking (boolean off path; emits the kwarg). */
   off: boolean;
+  /**
+   * Effort-vocabulary token the template treats as "off" (none/off/no_think).
+   * Its presence exposes the off level; it is the payload value for off.
+   */
+  offToken?: string;
   /**
    * Variable names the template actually references (subset of
    * ["reasoning_effort", "reasoning_strength"]); undefined → unknown
@@ -55,6 +70,60 @@ export interface ThinkingStyle {
   effort?: EffortStyle;
 }
 
+interface EffortLiterals {
+  /** Values in comparisons (==/!=/in/not-in) — what the template distinguishes. */
+  compared: string[];
+  /** Values assigned as defaults (set effort = 'v' / else 'v'). */
+  defaults: string[];
+  /** The effort string is concatenated into the prompt (free-form interpolation). */
+  interpolated: boolean;
+}
+
+/**
+ * Collect the literal effort values a template compares against or assigns,
+ * scoped line-by-line to lines referencing reasoning_effort / reasoning_strength
+ * (live templates keep each comparison on one line).
+ */
+export function extractEffortLiterals(ct: string): EffortLiterals | undefined {
+  const compared: string[] = [];
+  const defaults: string[] = [];
+  let interpolated = false;
+  let seen = false;
+
+  const push = (target: string[], value: string) => {
+    if (!target.includes(value)) target.push(value);
+  };
+  const pushList = (target: string[], list: string) => {
+    for (const m of list.matchAll(/['"]([a-z_]+)['"]/g)) push(target, m[1]);
+  };
+
+  for (const line of ct.split("\n")) {
+    if (!/\breasoning_(?:effort|strength)\b/.test(line)) continue;
+    seen = true;
+
+    // == / != against a literal (optionally through a Jinja filter: `| lower`)
+    for (const m of line.matchAll(
+      /\breasoning_(?:effort|strength)\b(?:\s*\|\s*[a-z_]+(?:\([^)]*\))?)?\s*[!=]=\s*['"]([a-z_]+)['"]/g,
+    )) push(compared, m[1]);
+
+    // not in [..] / (..)
+    for (const m of line.matchAll(/\bnot\s+in\s*[\[(]([^)\]]*)[\])]/g)) pushList(compared, m[1]);
+    // bare `in [..]` / `( .. )` (excluding `not in` matches above)
+    for (const m of line.matchAll(/(?<!not\s)(?<!\w)\bin\s*[\[(]([^)\]]*)[\])]/g)) pushList(compared, m[1]);
+
+    // Default assignments: set reasoning_effort = 'v'  /  ... else 'v'
+    for (const m of line.matchAll(/\bset\s+reasoning_(?:effort|strength)\s*=\s*['"]([a-z_]+)['"]/g)) push(defaults, m[1]);
+    for (const m of line.matchAll(/\belse\s+['"]([a-z_]+)['"]/g)) push(defaults, m[1]);
+
+    // Effort string concatenated into the prompt (free-form interpolation)
+    if (/\+\s*reasoning_(?:effort|strength)\b|\breasoning_(?:effort|strength)\s*\+/.test(line)) {
+      interpolated = true;
+    }
+  }
+
+  return seen ? { compared, defaults, interpolated } : undefined;
+}
+
 /**
  * Parse tier info from an effort-style chat template.
  * All patterns are scoped to effort-vocabulary literals so unrelated
@@ -62,8 +131,21 @@ export interface ThinkingStyle {
  */
 export function parseEffortTemplate(ct: string): EffortStyle {
   let levels: string[] | undefined;
+  let offToken: string | undefined;
 
-  // 1) Membership tuple: not in ('xhigh', 'medium', 'low')
+  // 0) Scoped literals: the template's own reasoning_effort/reasoning_strength
+  //    comparisons and default assignments decide the exposed tier set.
+  const lit = extractEffortLiterals(ct);
+  if (lit && lit.compared.length > 0) {
+    const all = [...new Set([...lit.compared, ...lit.defaults])];
+    offToken = all.find((v) => OFF_TOKENS.has(v));
+    const scoped = all.filter((v) => v !== offToken && EFFORT_VOCABULARY.has(v));
+    if (offToken || scoped.length > 0) levels = scoped; // [] = only off is expressible
+  }
+
+  // 1) Membership tuple (unscoped — comparisons split across lines):
+  //    not in ('xhigh', 'medium', 'low')
+  if (!levels) {
   for (const m of ct.matchAll(/not\s+in\s+\(([^)]*)\)/g)) {
     const values = [...m[1].matchAll(/['"]([A-Za-z0-9_]+)['"]/g)].map((x) => x[1]);
     if (
@@ -74,6 +156,7 @@ export function parseEffortTemplate(ct: string): EffortStyle {
       levels = values;
       break;
     }
+  }
   }
 
   // 2) Raise message: "Supported types are xhigh (default), medium, and low."
@@ -109,6 +192,7 @@ export function parseEffortTemplate(ct: string): EffortStyle {
     levels,
     aliases: Object.keys(aliases).length > 0 ? aliases : undefined,
     off: /enable_thinking/.test(ct),
+    offToken,
     varNames: varNames.length > 0 ? varNames : undefined,
   };
 }
@@ -173,9 +257,10 @@ export function buildEffortLevelMap(effort: EffortStyle): Record<string, string 
     }
   }
 
-  // Off — only when the template gates on enable_thinking; "none" disables
-  // reasoning server-side, and the effort kwargs stay inert (gate skips them).
-  if (effort.off) map.off = "none";
+  // Off — when the template has an off path: an enable_thinking gate (→ "none",
+  // effort kwargs stay inert, the gate skips them) or an off-token in its effort
+  // vocabulary (e.g. no_think), which is the payload value for off.
+  if (effort.off || effort.offToken) map.off = effort.offToken ?? "none";
 
   return map;
 }

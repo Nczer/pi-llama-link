@@ -58,8 +58,9 @@ export function applyEnableThinkingSupport(model: Record<string, any>): void {
 /** Apply effort-style thinking support (reasoning_effort / reasoning_strength effort string).
  *  Emit only the variable names the template actually references (parsed from the
  *  template text); fall back to both names when detection was caps-only (no text).
- *  Off → "none" (server disables reasoning), only when the template
- *  gates on enable_thinking — otherwise off is hidden (channel has no off path). */
+ *  Only levels the template distinguishes are exposed (buildEffortLevelMap);
+ *  off maps to the template's off-token (no_think, ...) or "none" for
+ *  enable_thinking-gated templates. */
 export function applyEffortThinkingSupport(model: Record<string, any>, effort: EffortStyle): void {
   model.reasoning = true;
   model.thinkingLevelMap = buildEffortLevelMap(effort);
