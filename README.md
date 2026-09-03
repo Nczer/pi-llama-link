@@ -23,23 +23,25 @@ One local server always present. Remote server is opt-in.
 | Provider ID | Default | Configurable |
 |-------------|---------|--------------|
 | `llama-cpp` | `http://127.0.0.1:8080` | Yes (see below) |
-| `llama-cpp-remote` | None (opt-in) | Yes (`llamaServerRemoteUrl`) |
+| `llama-cpp-remote` | None (opt-in) | Yes (`remoteUrl`) |
 
 ### URL Resolution (local server)
 
-Priority order: `LLAMA_SERVER_URL` env → `settings.json` (`llamaServerUrl`) → `127.0.0.1:8080`.
+Priority order: `LLAMA_SERVER_URL` env → `serverUrl` setting → `127.0.0.1:8080`.
 
 ### URL Resolution (remote server)
 
-`settings.json` (`llamaServerRemoteUrl`) → omitted if not set. Set to `""` to explicitly disable.
+`remoteUrl` setting → omitted if not set. Set to `""` to explicitly disable.
 
 ## Settings
 
+`llama-link` namespace of `~/.pi/agent/settings-ext.json` (managed by `ext-settings.ts`; defaults are materialized on first load, corrupt files are auto-backed up as `.bak`):
+
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `llamaLinkEnabled` | `true` | Toggle extension on/off via `/llama-link` |
-| `llamaServerUrl` | `http://127.0.0.1:8080` | Local server URL (overridden by env var) |
-| `llamaServerRemoteUrl` | None | Remote server URL (opt-in) |
+| `enabled` | `true` | Toggle extension on/off via `/llama-link` |
+| `serverUrl` | `http://127.0.0.1:8080` | Local server URL (overridden by env var) |
+| `remoteUrl` | None | Remote server URL (opt-in) |
 
 ## SSE Loading Progress
 
@@ -88,16 +90,17 @@ Discovered metadata (style + parsed tiers/aliases) is persisted to `llama-metada
 
 ## Architecture
 
-- `rpc(server, endpoint, body?)` — per-server HTTP client (all API calls go through this)
-- `fetchSlots(server, modelId?)` — `GET /slots` (or `/slots?model=X` in router mode)
-- `fetchMetrics(server, modelId?)` — `GET /metrics` (Prometheus text format, parsed to MetricsData)
-- `fetchV1Models(server)` — `GET /v1/models` for rich metadata (n_params, n_vocab, size)
-- `loadModel(server, modelId)` — `POST /models/load` (router mode)
-- `detectMode(res)` — `models` field present → single, absent → router
-- `ModelInspector.status(id)` — router: from `/models` data; single: from `/props`. Returns `loaded|loading|sleeping|unloaded|failed`
-- `resolveContextSize(model)` — router: parses `--ctx-size`/`-c`/`-ctx`/`--fit-ctx` from `status.args`; single: `meta.n_ctx`, then `n_ctx_train`. Fallback: 32768.
+**Modules**
+
+- `index.ts` — pi glue: hooks, commands, TUI (status overlay, SSE loading indicator), metadata overlay + sync orchestration
+- `server.ts` — server layer: server resolution + per-server auth, `rpc()` JSON client + SSE stream parsing, endpoint helpers (`fetchSlots`/`fetchMetrics`/`fetchV1Models`/`loadModel`), `detectMode`, `resolveContextSize`, load-wait state machine (`loadModelAndWait`), cached `ModelInspector`. No pi runtime dependency.
 - `thinking-style.ts` — pure style classification + tier parsing over /props data (no pi dependency)
 - `thinking.ts` — applies the discovered style to Pi model configs (level maps, compat kwargs) and decides `thinking_budget_tokens` injection
+- `ext-settings.ts` — loads/patches the `llama-link` namespace of `settings-ext.json` (defaults merge, corrupt-file auto-backup)
+
+**Key functions**
+
+- `ModelInspector.status(id)` — router: from `/models` data; single: from `/props`. Returns `loaded|loading|sleeping|unloaded|failed`
 - `buildStatusLines(current)` — gathers all data, returns plain string lines
 - `buildBorderDynamic(theme, lines, width)` — wraps lines in box-drawing border using `visibleWidth()` for emoji-safe padding
 
@@ -119,10 +122,15 @@ The `/llama-model` overlay shows per-server:
 - **Metrics requires `--metrics`**: `/metrics` returns 501 if server started without `--metrics` flag. Gracefully degrades (shows nothing).
 - **Slots may be disabled**: `/slots` can be disabled with `--no-slots`. Gracefully degrades.
 - **Context size fallback**: models with no `--ctx-size` in args get 32768 default.
-- **Remote is opt-in**: no default remote URL. Must be set explicitly in `settings.json`.
+- **Remote is opt-in**: no default remote URL. Must be set explicitly in `settings-ext.json` (`llama-link` namespace).
 - **Provider IDs**: both `llama-server` and `llama-cpp` are accepted for unload checks.
 - **Multi-server**: `rpc` takes a `ServerConfig`, not a global URL. All helpers are per-server.
 - **V1 models ID matching**: `/v1/models` reports real ids only (and may return full paths); match by checking if ID ends with the model id from `/models`.
 - **Aliases as Pi ids**: models.json uses each model's first alias as the id when present; `/llama-load <alias>`, status display, and `/llama-unload` all resolve aliases against the server's `/models` data.
 - **Metrics parsing**: Prometheus text format — skip `#` comments, split on last space for value.
 - **Load UI**: `/llama-load` with no args shows `ctx.ui.select` picker. With an arg, loads directly.
+
+## Development
+
+- Tests: `npx vitest run` — pure modules only (`thinking-style`, `thinking`, `server`, `ext-settings`); the pi glue in `index.ts` is verified in a live session
+- Run `pi --extension .../index.ts` and test the hooks and commands in a live session
