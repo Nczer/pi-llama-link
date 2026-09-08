@@ -17,7 +17,7 @@ import {
   resetDiscoveryState,
 } from "./metadata";
 import { patchExtSettings } from "./ext-settings";
-import { syncToModelsJson, flushModelsWrite } from "./sync";
+import { syncToModelsJson, flushModelsWrite, modelsJsonApiId } from "./sync";
 import {
   PROVIDER_NAME,
   PROVIDER_IDS,
@@ -35,6 +35,7 @@ import {
   parseSseStream,
   type ServerInfo,
   type ServerMode,
+  type ServerConfig,
   type ModelsResponse,
 } from "./server";
 
@@ -59,6 +60,70 @@ function setLlamaStatus(ctx: ExtensionContext, value: string | undefined): void 
   if (value === lastLlamaStatus) return;
   lastLlamaStatus = value;
   try { ctx.ui.setStatus("llama", value); } catch { /* stale context */ }
+}
+
+// ── Switching Pi's current model to a server model ─────────────────
+
+/**
+ * Point Pi's current model at a model on this server (no-op when it is
+ * already current). models.json is read at pi startup — if the model isn't
+ * in it yet (e.g. just registered on the server) sync + flush first, then
+ * refresh the registry (re-reads models.json, no /reload needed) and
+ * switch. Returns false when the switch did not happen.
+ */
+async function switchPiModel(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  server: ServerConfig,
+  m: { id: string; aliases?: string[] },
+): Promise<boolean> {
+  const current = ctx.model;
+  if (current && (current as any).provider === server.id && matchModel(m, current.id)) {
+    return true;
+  }
+
+  let apiId = modelsJsonApiId(server.id, m);
+  if (!apiId) {
+    await syncToModelsJson().catch(() => {});
+    flushModelsWrite();
+    apiId = modelsJsonApiId(server.id, m);
+  }
+  if (!apiId) {
+    ctx.ui.notify(`${m.aliases?.[0] || m.id} missing from models.json — /llama-sync then /reload`, "error");
+    return false;
+  }
+  await ctx.modelRegistry.refresh({ providers: [server.id] }).catch(() => {});
+  const model = ctx.modelRegistry.find(server.id, apiId);
+  if (!model) {
+    ctx.ui.notify(`${apiId} not found in model registry — /llama-sync then /reload`, "error");
+    return false;
+  }
+  const ok = await pi.setModel(model);
+  if (!ok) {
+    ctx.ui.notify(`Could not switch: no API key configured for ${server.id}`, "error");
+    return false;
+  }
+  ctx.ui.notify(`Current model → ${apiId}`, "info");
+  return true;
+}
+
+/**
+ * Resolve a server-side model entry by id or alias (fresh /models fetch)
+ * and switch Pi's current model to it. Used for the /llama-load auto-switch.
+ */
+async function switchToLoaded(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  server: ServerConfig,
+  idOrAlias: string,
+): Promise<void> {
+  const res = await rpc<ModelsResponse>(server, "/models").catch(() => undefined);
+  const entry = (res?.data || []).find((m) => matchModel(m, idOrAlias));
+  if (!entry) {
+    ctx.ui.notify(`${idOrAlias} not found on ${server.name} — current model unchanged`, "warning");
+    return;
+  }
+  await switchPiModel(pi, ctx, server, entry);
 }
 
 // ── Unload Command ────────────────────────────────────────────────────
@@ -137,7 +202,7 @@ async function unloadModel(ctx: ExtensionCommandContext): Promise<void> {
   }
 }
 
-async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Promise<void> {
+async function loadModelCmd(pi: ExtensionAPI, ctx: ExtensionCommandContext, modelArg: string): Promise<void> {
   const servers = resolveServers();
   const modelProvider = (ctx.model as any)?.provider;
   const server = (modelProvider && PROVIDER_IDS.includes(modelProvider))
@@ -156,17 +221,21 @@ async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Pro
   }
 
   if (modelArg) {
+    let loaded = false;
     try {
       await loadModelAndWait(server, modelArg, (s) => setLlamaStatus(ctx, s));
       ctx.ui.notify(`Loaded ${modelArg} on ${server.name}`, "info");
+      loaded = true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("already running") || msg.includes("already loaded")) {
         ctx.ui.notify(`${modelArg} is already loaded`, "info");
+        loaded = true;
       } else {
         ctx.ui.notify(`Failed to load: ${msg}`, "error");
       }
     }
+    if (loaded) await switchToLoaded(pi, ctx, server, modelArg);
     return;
   }
 
@@ -204,17 +273,21 @@ async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Pro
   }
 
   const displayName = selected.aliases?.[0] || selected.id;
+  let loaded = false;
   try {
     await loadModelAndWait(server, selected.id, (s) => setLlamaStatus(ctx, s));
     ctx.ui.notify(`Loaded ${displayName} on ${server.name}`, "info");
+    loaded = true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("already running") || msg.includes("already loaded")) {
       ctx.ui.notify(`${displayName} is already loaded`, "info");
+      loaded = true;
     } else {
       ctx.ui.notify(`Failed to load: ${msg}`, "error");
     }
   }
+  if (loaded) await switchToLoaded(pi, ctx, server, selected.id);
 }
 
 // ── Session-start notice ──────────────────────────────────────────────
@@ -222,10 +295,15 @@ async function loadModelCmd(ctx: ExtensionCommandContext, modelArg: string): Pro
 /**
  * Announce loaded models at session start so the user can see at a glance
  * whether the server's loaded model is the one Pi has selected.
- * Also warns when the selected model is not loaded while another model is
- * loaded on the same server (an unloaded-but-free server is not a conflict).
+ * When the selected model is a llama-cpp model that isn't loaded while
+ * another model is, confirm-first offer to switch Pi to a loaded model
+ * (an unloaded-but-free server is not a conflict).
  */
-async function announceLoadedModels(serverInfo: ServerInfo[], ctx: ExtensionContext): Promise<void> {
+async function announceLoadedModels(
+  serverInfo: ServerInfo[],
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+): Promise<void> {
   const current = ctx.model;
   const currentProvider = (current as any)?.provider;
 
@@ -250,18 +328,87 @@ async function announceLoadedModels(serverInfo: ServerInfo[], ctx: ExtensionCont
       );
     }
 
-    // Warn only when another model is loaded on this server but the selected
-    // one isn't — with nothing loaded there is no conflict to warn about.
+    // Conflict: selected model belongs to this server's provider but isn't
+    // loaded while another model is — with nothing loaded there is no
+    // conflict to warn about.
     if (currentProvider === server.id && loaded.length > 0 && !loaded.some(isCurrent)) {
       const status = await inspector.status(current!.id).catch(() => "unknown");
-      if (status !== "loading") {
-        ctx.ui.notify(
-          `${PROVIDER_NAME}: ${current!.id} not loaded on ${server.name} -- /llama-load ${current!.id}`,
-          "warning",
-        );
-      }
+      if (status === "loading") continue; // the load may still finish
+      await offerSwitchToLoaded(pi, ctx, server, loaded, current!.id);
+      return; // one prompt per startup
     }
   }
+}
+
+/**
+ * Confirm-first switch at session start: Pi's current model belongs to this
+ * server's provider but isn't loaded while other models are. Server state
+ * is re-fetched AFTER the user answers — the dialog stays up while loads
+ * run (minutes for big models), so state may have changed in the meantime.
+ */
+async function offerSwitchToLoaded(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  server: ServerConfig,
+  loaded: Array<{ id: string; name: string; aliases?: string[]; status: string }>,
+  currentId: string,
+): Promise<void> {
+  if (!ctx.hasUI) {
+    ctx.ui.notify(
+      `${PROVIDER_NAME}: ${currentId} not loaded on ${server.name} -- /llama-load ${currentId}`,
+      "warning",
+    );
+    return;
+  }
+
+  // Disambiguate duplicate display names so each option maps 1:1 to a model
+  const nameCounts = new Map<string, number>();
+  for (const m of loaded) {
+    const name = m.aliases?.[0] || m.id;
+    nameCounts.set(name, (nameCounts.get(name) || 0) + 1);
+  }
+  const labelOf = (m: { id: string; aliases?: string[] }): string => {
+    const name = m.aliases?.[0] || m.id;
+    return (nameCounts.get(name) || 0) > 1 ? `${name} (${m.id})` : name;
+  };
+  const KEEP = "Keep current model";
+
+  let choice: string | undefined;
+  try {
+    choice = await ctx.ui.select(
+      `${PROVIDER_NAME}: current model ${currentId} is not loaded on ${server.name} — switch?`,
+      [...loaded.map(labelOf), KEEP],
+    );
+  } catch {
+    return; // dialog unavailable (stale context) — keep current
+  }
+  if (!choice || choice === KEEP) return;
+  const target = loaded.find((m) => labelOf(m) === choice);
+  if (!target) return;
+
+  // Race guard: re-fetch server state (something may have loaded/unloaded
+  // while the dialog was open).
+  let fresh: ModelsResponse;
+  try {
+    fresh = await rpc<ModelsResponse>(server, "/models");
+  } catch {
+    ctx.ui.notify(`${server.name} unreachable — kept current model`, "warning");
+    return;
+  }
+  const freshLoaded = await new ModelInspector(server, {
+    data: fresh.data || [],
+    mode: detectMode(fresh),
+  }).loadedModels().catch(() => []);
+  if (freshLoaded.some((m) => matchModel(m, currentId))) {
+    ctx.ui.notify(`${PROVIDER_NAME}: ${currentId} loaded in the meantime — kept current model`, "info");
+    return;
+  }
+  const freshTarget = freshLoaded.find((m) => m.id === target.id);
+  if (!freshTarget) {
+    ctx.ui.notify(`${PROVIDER_NAME}: ${target.name} no longer loaded — kept current model`, "warning");
+    return;
+  }
+  await switchPiModel(pi, ctx, server, freshTarget);
 }
 
 // ── Extension Entry ───────────────────────────────────────────────────
@@ -292,7 +439,7 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
   pi.registerCommand("llama-load", {
     description: `Load a ${PROVIDER_NAME} model (router mode)`,
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      await loadModelCmd(ctx, args.trim());
+      await loadModelCmd(pi, ctx, args.trim());
     },
   });
 
@@ -310,7 +457,7 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
       // One /models fetch per server, shared by sync and the loaded-model notice
       const serverInfo = await gatherServers();
       await syncToModelsJson(serverInfo, (v) => setLlamaStatus(ctx, v));
-      await announceLoadedModels(serverInfo, ctx);
+      await announceLoadedModels(serverInfo, ctx, pi);
     } catch {}
   });
 

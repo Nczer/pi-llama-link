@@ -73,6 +73,37 @@ describe("modelsChanged", () => {
   });
 });
 
+describe("modelsJsonApiId", () => {
+  const provider = "llama-cpp";
+  const writeModels = (models: any[]) =>
+    writeFileSync(modelsFile, JSON.stringify({ providers: { [provider]: { models } } }));
+
+  afterAll(() => rmSync(modelsFile, { force: true }));
+
+  it("alias id wins when the entry id is the first alias", () => {
+    writeModels([{ id: "short-1" }, { id: "other" }]);
+    expect(sync.modelsJsonApiId(provider, { id: "real-1", aliases: ["short-1", "alt-1"] })).toBe("short-1");
+  });
+
+  it("matches on the real id when no alias is exposed", () => {
+    writeModels([{ id: "real-1" }]);
+    expect(sync.modelsJsonApiId(provider, { id: "real-1", aliases: ["short-1"] })).toBe("real-1");
+  });
+
+  it("matches on a non-first alias", () => {
+    writeModels([{ id: "alt-1" }]);
+    expect(sync.modelsJsonApiId(provider, { id: "real-1", aliases: ["short-1", "alt-1"] })).toBe("alt-1");
+  });
+
+  it("unknown model / unknown provider / missing file → undefined", () => {
+    writeModels([{ id: "short-1" }]);
+    expect(sync.modelsJsonApiId(provider, { id: "nope", aliases: ["nope-alias"] })).toBeUndefined();
+    expect(sync.modelsJsonApiId("llama-cpp-remote", { id: "real-1", aliases: ["short-1"] })).toBeUndefined();
+    rmSync(modelsFile, { force: true });
+    expect(sync.modelsJsonApiId(provider, { id: "real-1", aliases: ["short-1"] })).toBeUndefined();
+  });
+});
+
 describe("syncToModelsJson (integration, local HTTP server)", () => {
   let server: http.Server;
   const notified: Array<string | undefined> = [];

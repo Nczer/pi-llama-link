@@ -42,6 +42,22 @@ function loadModelsJson(): ModelsJson {
 }
 
 /**
+ * The models.json id under which a server model is exposed (entry id must
+ * be the real id or one of its aliases), or undefined when the provider or
+ * model isn't in the file yet.
+ */
+export function modelsJsonApiId(
+  providerId: string,
+  m: { id: string; aliases?: string[] },
+): string | undefined {
+  const models = loadModelsJson().providers[providerId]?.models || [];
+  const entry = models.find(
+    (e: any) => e.id === m.id || (m.aliases?.includes(e.id) ?? false),
+  );
+  return entry?.id;
+}
+
+/**
  * Map each server model's real id to the id used in models.json:
  * the first alias when present and not claimed by another model,
  * otherwise the real id. llama.cpp resolves aliases on all endpoints

@@ -10,8 +10,8 @@ Requires Pi ≥ 0.80.6 (uses the `max` thinking tier).
 |---------|-------------|
 | `/llama-model` | Overlay popup showing server status, model metadata, slots, metrics, and available models |
 | `/llama-unload` | Unload the current model if it's from a llama.cpp provider |
-| `/llama-load` | Open model picker to load a model (router mode) |
-| `/llama-load <id>` | Load a specific model by ID (router mode) |
+| `/llama-load` | Open model picker to load a model (router mode); Pi's current model switches to it |
+| `/llama-load <id>` | Load a specific model by ID (router mode); Pi's current model switches to it |
 | `/llama-sync` | Manually sync all server models to `models.json` |
 | `/llama-version` | Print `llama-server --version` output |
 | `/llama-link` | Toggle llama-link extension on/off |
@@ -70,7 +70,8 @@ On `session_start`, syncs model metadata to `~/.pi/agent/models.json`.
 The `session_start` sync reuses a single `/models` fetch per server for both sync and the loaded-model notice:
 
 - **Notice per loaded model**: `Llama.cpp: {model} {status} on {server}` — suffixed `— current model` when it matches the model Pi has selected
-- **Warning** when Pi's selected model is a llama-cpp model that none of the configured servers has loaded (the first request would fail; skipped while a model is still loading)
+- **Confirm-first switch** when Pi's selected model is a llama-cpp model that isn't loaded while other models are (skipped while a load is in flight): a selector offers the loaded models plus "Keep current model"; choosing one switches Pi's current model. Server state is re-fetched *after* the answer — the dialog can stay open while a load runs (minutes), so a model may have loaded/unloaded in the meantime (switch is skipped when the current model is now loaded or the chosen one isn't). Headless modes (`hasUI` false) fall back to the plain warning
+- **Model switch plumbing** (used by both `/llama-load` and the session-start switch): `modelsJsonApiId()` (sync.ts) finds the models.json id of a server model; when the model is missing from models.json a fresh sync + flush runs first, then `ctx.modelRegistry.refresh({ providers: [id] })` re-reads models.json (no `/reload` needed) and `pi.setModel()` switches
 
 ## Thinking Support
 
@@ -93,12 +94,12 @@ Discovered metadata (style + parsed tiers/aliases) is persisted to `llama-metada
 
 **Modules**
 
-- `index.ts` — pi glue: hooks, commands, TUI (status overlay, SSE loading indicator), metadata overlay + sync orchestration
+- `index.ts` — pi glue: hooks, commands, TUI (status overlay, SSE loading indicator), metadata overlay + sync orchestration, model switching (`switchPiModel`/`switchToLoaded`, session-start `offerSwitchToLoaded`)
 - `server.ts` — server layer: server resolution + per-server auth, `rpc()` JSON client + SSE stream parsing, endpoint helpers (`fetchSlots`/`fetchMetrics`/`fetchV1Models`/`loadModel`), `detectMode`, `resolveContextSize`, load-wait state machine (`loadModelAndWait`), cached `ModelInspector`. No pi runtime dependency.
 - `metadata.ts` — per-server:model capability metadata (thinking style, context window) persisted to `llama-metadata.json`: debounced store, key migration + stale pruning, overlay application, lazy `/props` discovery
 - `thinking-style.ts` — pure style classification + template-derived tier exposure over /props data (no pi dependency)
 - `thinking.ts` — applies the discovered style to Pi model configs (level maps, compat kwargs) and decides `thinking_budget_tokens` injection
-- `sync.ts` — `models.json` sync: alias-based ids (`resolveApiIds`), change detection, debounced write + flush, stale-provider pruning; applies the metadata overlay per model
+- `sync.ts` — `models.json` sync: alias-based ids (`resolveApiIds`, `modelsJsonApiId` lookup), change detection, debounced write + flush, stale-provider pruning; applies the metadata overlay per model
 - `sse.ts` — persistent `/models/sse` listener: loading-progress status bar with exponential-backoff reconnect; all pi access via injected `SseGlue`
 - `status.ts` — the `/llama-model` overlay: `buildStatusLines` (accepts a pre-fetched `ServerInfo[]`) + border rendering
 - `ext-settings.ts` — loads/patches the `llama-link` namespace of `settings-ext.json` (defaults merge, corrupt-file auto-backup; hosts shared `atomicWrite`)
