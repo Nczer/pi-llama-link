@@ -4,13 +4,12 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { thinkingBudgetFor } from "./thinking";
-import { showStatus } from "./status";
+import { showStatus, STATUS_ICONS } from "./status";
 import {
-  startSseForServer,
-  stopSse,
-  isSseActive,
-  type SseGlue,
-} from "./sse";
+  startInflightWatch,
+  stopInflightWatch,
+  type WatchGlue,
+} from "./watch";
 import {
   discoverModelMetadata,
   flushMetadataWrite,
@@ -52,8 +51,8 @@ function isLlamaStatusEnabled(): boolean {
   return loadSettings().enabled !== false; // default true
 }
 
-// Dedup for the "llama" status-bar slot. SSE progress events fire faster
-// than the displayed string changes, so redundant setStatus calls (and the
+// Dedup for the "llama" status-bar slot. Watcher polls fire faster than
+// the displayed string changes, so redundant setStatus calls (and the
 // TUI re-renders they trigger) are skipped.
 let lastLlamaStatus: string | undefined;
 function setLlamaStatus(ctx: ExtensionContext, value: string | undefined): void {
@@ -214,10 +213,6 @@ async function loadModelCmd(pi: ExtensionAPI, ctx: ExtensionCommandContext, mode
   } catch {
     ctx.ui.notify(`${server.name} unreachable`, "error");
     return;
-  }
-
-  if (!isSseActive()) {
-    startSseForServer(server.id, ctx);
   }
 
   if (modelArg) {
@@ -413,8 +408,8 @@ async function offerSwitchToLoaded(
 
 // ── Extension Entry ───────────────────────────────────────────────────
 
-// Pi-glue for the SSE status bar (sse.ts): stale-safe theme + status access.
-const sseGlue: SseGlue = {
+// Pi-glue for the status bar (watch.ts): stale-safe theme + status access.
+const watchGlue: WatchGlue = {
   getTheme: (ctx) => {
     try { return (ctx as ExtensionContext).ui.theme; } catch { return undefined; }
   },
@@ -461,32 +456,14 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     } catch {}
   });
 
-  // ── SSE Model Loading Progress ──────────────────────────────────────
+  // ── Inflight Progress (auto-load) ───────────────────────────────────
 
-  // Connect SSE listener early on session start to catch auto-load events
-  pi.on("session_start", async (_event: any, ctx: ExtensionContext) => {
-    if (!isLlamaStatusEnabled()) return;
-    const provider = (ctx.model as any)?.provider;
-    if (provider && PROVIDER_IDS.includes(provider) && !isSseActive()) {
-      startSseForServer(provider, ctx, sseGlue);
-    }
-  });
-
-  pi.on("model_select", async (event: any, ctx: ExtensionContext) => {
-    if (!isLlamaStatusEnabled()) return;
-    const provider = (event.model as any)?.provider;
-    if (!provider || !PROVIDER_IDS.includes(provider)) {
-      stopSse();
-      return;
-    }
-
-    if (isSseActive(provider)) return;
-
-    startSseForServer(provider, ctx, sseGlue);
-  });
+  // No persistent server connection: the progress display runs only
+  // while a provider request is in flight — see the
+  // before/after_provider_request hooks below.
 
   pi.on("session_shutdown", async () => {
-    stopSse();
+    stopInflightWatch();
     // Flush pending debounced writes before clearing
     flushModelsWrite();
     flushMetadataWrite();
@@ -522,9 +499,17 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
 
   pi.on("before_provider_request", (event, ctx) => {
     if (!isLlamaStatusEnabled()) return;
-    const provider = (ctx.model as any)?.provider;
+    const model = ctx.model;
+    const provider = (model as any)?.provider;
     if (!PROVIDER_IDS.includes(provider || "")) return;
-    const budget = thinkingBudgetFor(ctx.model, pi.getThinkingLevel());
+
+    // Live progress in the status bar while the model auto-loads
+    const server = resolveServers().find((s) => s.id === provider);
+    if (server && model) {
+      void startInflightWatch({ server, modelId: model.id, ctx, glue: watchGlue });
+    }
+
+    const budget = thinkingBudgetFor(model, pi.getThinkingLevel());
     if (budget === undefined) return;
 
     return {
@@ -536,13 +521,16 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
   // /props metadata after first successful provider response
   // (model is guaranteed loaded by this point — no race with model loading)
   pi.on("after_provider_response", (event, ctx) => {
+    // Headers arrive when llama-server finishes the prompt — stop the
+    // inflight watcher regardless of response status
+    const provider = (ctx.model as any)?.provider;
+    if (PROVIDER_IDS.includes(provider || "")) stopInflightWatch();
+
     if (!isLlamaStatusEnabled()) return;
     if (event.status !== 200) return;
-    const model = ctx.model;
-    if (!model) return;
-    const provider = (model as any)?.provider;
+    if (!ctx.model) return;
     if (!PROVIDER_IDS.includes(provider || "")) return;
-    void discoverModelMetadata(provider, model.id, {
+    void discoverModelMetadata(provider, ctx.model.id, {
       notify: (msg, type) => {
         try { ctx.ui.notify(msg, type); } catch { /* stale context */ }
       },
@@ -562,7 +550,7 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
       patchExtSettings("llama-link", { enabled: next });
       loadSettings(); // re-read patched value, warm the server.ts cache
       if (!next) {
-        stopSse();
+        stopInflightWatch();
         setLlamaStatus(ctx, undefined);
       }
       ctx.ui.notify(next ? "Llama link enabled" : "Llama link disabled", next ? "info" : "warning");

@@ -23,7 +23,7 @@ import {
   type MetricsData,
 } from "./server";
 
-const STATUS_ICONS: Record<string, string> = {
+export const STATUS_ICONS: Record<string, string> = {
   loaded: "🟢",
   loading: "🟡",
   sleeping: "🔵",

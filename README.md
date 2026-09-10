@@ -43,15 +43,16 @@ Priority order: `LLAMA_SERVER_URL` env → `serverUrl` setting → `127.0.0.1:80
 | `serverUrl` | `http://127.0.0.1:8080` | Local server URL (overridden by env var) |
 | `remoteUrl` | None | Remote server URL (opt-in) |
 
-## SSE Loading Progress
+## Inflight Progress
 
-Connects to `/models/sse` to show real-time loading progress in the status bar:
+**Zero API calls while pi is idle.** There is no persistent server connection: a per-request watcher runs only between `before_provider_request` and `after_provider_response` (llama-server sends response headers when the prompt is done, so the window covers the whole request). Loads triggered by *other* clients of the same server are never shown.
 
-- **Stages**: `fit_params` → `text_model` → `mmproj_model` (for vision models)
-- **Display**: `Loading model 42%`, `Loading mmproj 78%`, etc.
-- **Reconnect**: Auto-reconnects with exponential backoff (up to 10 attempts, capped at 30s)
-- **Update dedup**: Status bar only updates when the progress string actually changes — SSE events fire faster than the percentage does, redundant `setStatus` calls are skipped
-- **Cleanup**: SSE connection stops when session ends or model switches away from llama.cpp
+500ms polling, one initial `/models` probe per request: the request triggered an auto-load (model not loaded / waking from sleep) → polls `/models` and shows `· Loading model 42%` (stages: `fit_params` → `text_model` → `mmproj_model`; no progress data → `· Loading ...`). The watcher stops when the model becomes loaded.
+
+- **Update dedup**: status bar only updates when the string changes — polls fire faster than the percentage does
+- **Lifecycle**: the watcher stops on response, on session shutdown, or after a 30-min safety cap; it clears the status slot only if it set it (never clobbers other status content)
+
+The `/llama-load` command has its own progress display (SSE with polling fallback, `loadModelAndWait`) — independent of the watcher.
 
 ## Auto-Sync
 
@@ -94,13 +95,13 @@ Discovered metadata (style + parsed tiers/aliases) is persisted to `llama-metada
 
 **Modules**
 
-- `index.ts` — pi glue: hooks, commands, TUI (status overlay, SSE loading indicator), metadata overlay + sync orchestration, model switching (`switchPiModel`/`switchToLoaded`, session-start `offerSwitchToLoaded`)
+- `index.ts` — pi glue: hooks, commands, TUI (status overlay), inflight-watch lifecycle, metadata overlay + sync orchestration, model switching (`switchPiModel`/`switchToLoaded`, session-start `offerSwitchToLoaded`)
 - `server.ts` — server layer: server resolution + per-server auth, `rpc()` JSON client + SSE stream parsing, endpoint helpers (`fetchSlots`/`fetchMetrics`/`fetchV1Models`/`loadModel`), `detectMode`, `resolveContextSize`, load-wait state machine (`loadModelAndWait`), cached `ModelInspector`. No pi runtime dependency.
 - `metadata.ts` — per-server:model capability metadata (thinking style, context window) persisted to `llama-metadata.json`: debounced store, key migration + stale pruning, overlay application, lazy `/props` discovery
 - `thinking-style.ts` — pure style classification + template-derived tier exposure over /props data (no pi dependency)
 - `thinking.ts` — applies the discovered style to Pi model configs (level maps, compat kwargs) and decides `thinking_budget_tokens` injection
 - `sync.ts` — `models.json` sync: alias-based ids (`resolveApiIds`, `modelsJsonApiId` lookup), change detection, debounced write + flush, stale-provider pruning; applies the metadata overlay per model
-- `sse.ts` — persistent `/models/sse` listener: loading-progress status bar with exponential-backoff reconnect; all pi access via injected `SseGlue`
+- `watch.ts` — per-request progress watcher (auto-load): on-demand `/models` polling with the status-bar display; all pi access via injected `WatchGlue`
 - `status.ts` — the `/llama-model` overlay: `buildStatusLines` (accepts a pre-fetched `ServerInfo[]`) + border rendering
 - `ext-settings.ts` — loads/patches the `llama-link` namespace of `settings-ext.json` (defaults merge, corrupt-file auto-backup; hosts shared `atomicWrite`)
 
@@ -138,5 +139,5 @@ The `/llama-model` overlay shows per-server:
 
 ## Development
 
-- Tests: `npx vitest run` — module-level tests (`thinking-style`, `thinking`, `server`, `metadata`, `sync`, `sse`, `status`, `ext-settings`), incl. local-HTTP integration for discovery, sync, and SSE; the pi glue in `index.ts` is verified in a live session
+- Tests: `npx vitest run` — module-level tests (`thinking-style`, `thinking`, `server`, `metadata`, `sync`, `watch`, `status`, `ext-settings`), incl. local-HTTP integration for discovery, sync, and the inflight watcher (load phase); the pi glue in `index.ts` is verified in a live session
 - Run `pi --extension .../index.ts` and test the hooks and commands in a live session

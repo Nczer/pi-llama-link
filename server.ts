@@ -57,7 +57,14 @@ export const LLAMA_LINK_DEFAULTS: LlamaLinkSettings = {
 export interface ModelsDataProperty {
   id: string;
   aliases?: string[];
-  status?: { value: string; args?: string[]; failed?: boolean; exit_code?: number };
+  status?: {
+    value: string;
+    args?: string[];
+    failed?: boolean;
+    exit_code?: number;
+    // Present while value === "loading": { stages, current, value } (0–1)
+    progress?: { stages?: unknown[]; current?: string; stage?: string; value?: number };
+  };
   architecture?: { input_modalities: string[] };
   meta?: { n_ctx: number; n_ctx_train: number };
 }
@@ -81,13 +88,31 @@ export interface PropsResponse {
   };
 }
 
+export interface SlotNextToken {
+  has_next_token?: boolean;
+  has_new_line?: boolean;
+  n_decoded: number;
+  n_remain: number;
+}
+
 export interface SlotInfo {
   is_processing: boolean;
   n_ctx: number;
-  next_token?: {
-    n_decoded: number;
-    n_remain: number;
-  };
+  // Object in older builds, array in current builds
+  next_token?: SlotNextToken | SlotNextToken[];
+}
+
+/** Aggregate decoded/remaining tokens of a slot across next_token entries. */
+export function slotTokenProgress(slot: SlotInfo): { decoded: number; remain: number } {
+  const t = slot.next_token;
+  const items = t ? (Array.isArray(t) ? t : [t]) : [];
+  let decoded = 0;
+  let remain = -1;
+  for (const item of items) {
+    decoded += item.n_decoded || 0;
+    if (item.n_remain > 0) remain = item.n_remain;
+  }
+  return { decoded, remain };
 }
 
 export interface MetricsData {
@@ -616,10 +641,9 @@ export class ModelInspector {
     const active = slots.filter((s) => s.is_processing);
     let decoded = 0, remain = -1;
     for (const s of active) {
-      if (s.next_token) {
-        decoded += s.next_token.n_decoded;
-        if (s.next_token.n_remain > 0) remain = s.next_token.n_remain;
-      }
+      const p = slotTokenProgress(s);
+      decoded += p.decoded;
+      if (p.remain > 0) remain = p.remain;
     }
     return { decoded, remain, totalSlots: slots.length, activeSlots: active.length };
   }
