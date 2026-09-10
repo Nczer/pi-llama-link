@@ -1,14 +1,20 @@
 /**
  * watch.ts — live auto-load progress for the provider request in flight:
  * pi's request triggered an auto-load (the model wasn't loaded / is waking
- * from sleep) → polls /models, shows "· Loading model 42%". The watcher
+ * from sleep) → follows the load, shows "· Loading model 42%". The watcher
  * stops when the model is loaded — there is nothing left to show.
  *
  * Zero calls while pi is idle: the watcher exists only between
  * before_provider_request and after_provider_response. Loads triggered by
- * other clients are never shown — there is no persistent SSE connection.
+ * other clients are never shown — SSE events are filtered to the watched
+ * model's server-side id.
  *
- * Data source: /models status { value: "loading", progress: { current, value } }
+ * Data source: /models/sse carries the progress ({ stages, current, value },
+ * throttled to 1/200ms server-side) — the /models REST endpoint never
+ * includes it. A slow /models heartbeat (2s) is the source of truth: it
+ * covers the queueing gap before the first SSE event, sleeping wake-ups
+ * (no SSE progress), stream drops, and servers without SSE (single-model
+ * mode). SSE provides instant percentage updates; it is never required.
  *
  * All pi interaction goes through WatchGlue (theme + status-bar set),
  * injected by index.ts; no pi dependency.
@@ -16,12 +22,13 @@
 import {
   rpc,
   matchModel,
+  watchModelEvents,
   type ServerConfig,
   type ModelsResponse,
 } from "./server";
 
 export interface WatchGlue {
-  /** Current theme from ctx.ui, or undefined if ctx is stale. */
+  /** Current theme from ctx, or undefined if ctx is stale. */
   getTheme: (ctx: unknown) => any;
   /** Stale-safe status-bar update (deduped). */
   setStatus: (ctx: unknown, value: string | undefined) => void;
@@ -68,14 +75,16 @@ export function formatLoadingProgress(state: LoadProgressState, theme: any): str
 
 // ── Watcher ───────────────────────────────────────────────────────────
 
-const DEFAULT_POLL_MS = 500;
+const DEFAULT_HEARTBEAT_MS = 2000; // slow /models poll alongside the SSE stream
 const MAX_WATCH_MS = 30 * 60_000; // safety cap for the whole watch (long loads)
 
 let generation = 0;
-let timer: NodeJS.Timeout | null = null;
+let heartbeatTimer: NodeJS.Timeout | null = null;
+let watchAbort: AbortController | null = null;
 let showing = false;
 let glue: WatchGlue | null = null;
 let watchCtx: unknown = null;
+let startedAt = 0;
 
 /**
  * Start watching the in-flight provider request (stops and restarts any
@@ -87,12 +96,12 @@ export async function startInflightWatch(opts: {
   modelId: string;
   ctx: unknown;
   glue: WatchGlue;
-  pollMs?: number;
+  pollMs?: number; // heartbeat interval (tests use a small value)
 }): Promise<void> {
   stopInflightWatch();
   const gen = ++generation;
   const { server, modelId, ctx, glue: g } = opts;
-  const pollMs = opts.pollMs ?? DEFAULT_POLL_MS;
+  const heartbeatMs = opts.pollMs ?? DEFAULT_HEARTBEAT_MS;
 
   // Initial probe: an already-loaded model has nothing left to show.
   const res = await rpc<ModelsResponse>(server, "/models").catch(() => undefined);
@@ -100,10 +109,11 @@ export async function startInflightWatch(opts: {
   const probe = (res.data || []).find((m) => matchModel(m, modelId));
   if (probe?.status?.value === "loaded") return;
 
-  const startedAt = Date.now();
+  startedAt = Date.now();
   showing = false;
   glue = g;
   watchCtx = ctx;
+  watchAbort = new AbortController();
 
   // Only we may clear the status slot: never touch it unless we set it.
   const setStatus = (v: string | undefined): void => {
@@ -118,7 +128,25 @@ export async function startInflightWatch(opts: {
     }
   };
 
-  const poll = async (): Promise<void> => {
+  // ── SSE: instant percentage updates for the watched model ──────────
+  // Ephemeral connection: opened here, closed by stopInflightWatch().
+  // The stream filters to the server-side id (aliases are resolved by the
+  // probe above); other clients' loads are never shown. A missing SSE
+  // endpoint (single-model mode) is fine — the heartbeat carries the
+  // display.
+  void watchModelEvents(server, probe?.id ?? modelId, watchAbort.signal, (_progress, data) => {
+    if (gen !== generation || !data?.status) return;
+    if (data.status !== "loading") return; // loaded/unloaded settle via heartbeat
+    const theme = g.getTheme(ctx);
+    if (!theme) return; // stale context
+    setStatus(formatLoadingProgress({ status: "loading", progress: data.progress }, theme));
+  });
+
+  // ── Heartbeat: /models state reconciliation ─────────────────────────
+  // Source of truth: catches the queueing gap before the first SSE event,
+  // sleeping wake-ups, stream drops, and SSE-less servers. Never overwrites
+  // a fresher SSE display while one is visible.
+  const heartbeat = async (): Promise<void> => {
     if (gen !== generation) return;
     if (Date.now() - startedAt > MAX_WATCH_MS) {
       stopInflightWatch();
@@ -135,36 +163,40 @@ export async function startInflightWatch(opts: {
       stopInflightWatch(); // load done — nothing left to show
       return;
     }
-    if (!value || value === "unloaded" || value === "failed") {
+    if (value === "loading" || value === "sleeping") {
+      if (!showing) {
+        const state: LoadProgressState = value === "sleeping"
+          ? { status: "loading" }
+          : { status: "loading", progress: entry?.status?.progress };
+        setStatus(formatLoadingProgress(state, theme));
+      }
+    } else {
       setStatus(undefined); // nothing loading yet (or it failed)
-      return;
     }
-    // "loading" — or "sleeping" while the server wakes it up (dots)
-    const state: LoadProgressState = value === "sleeping"
-      ? { status: "loading" }
-      : { status: value, progress: entry?.status?.progress };
-    setStatus(formatLoadingProgress(state, theme));
   };
 
-  void poll();
-  timer = setInterval(() => void poll(), pollMs);
+  void heartbeat();
+  heartbeatTimer = setInterval(() => void heartbeat(), heartbeatMs);
 }
 
 /** Stop the watcher; clears the status bar if we were showing. */
 export function stopInflightWatch(): void {
   generation++;
-  if (timer) {
-    clearInterval(timer);
-    timer = null;
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
   }
+  watchAbort?.abort();
+  watchAbort = null;
   if (showing && glue) {
     try { glue.setStatus(watchCtx, undefined); } catch { /* stale context */ }
   }
   showing = false;
   glue = null;
   watchCtx = null;
+  startedAt = 0;
 }
 
 export function isInflightWatchActive(): boolean {
-  return timer !== null;
+  return heartbeatTimer !== null;
 }

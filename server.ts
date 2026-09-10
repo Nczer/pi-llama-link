@@ -422,7 +422,7 @@ export async function watchModelEvents(
   server: ServerConfig,
   modelId: string,
   signal: AbortSignal,
-  onProgress?: (progress: LoadProgress) => void,
+  onProgress?: (progress: LoadProgress | undefined, data: any) => void,
 ): Promise<void> {
   const apiKey = resolveApiKey(server.id);
   try {
@@ -444,8 +444,7 @@ export async function watchModelEvents(
           // Stop watching once settled — the poller is the source of truth
           if (status === "loaded" || status === "unloaded") return;
           if (onProgress) {
-            const progress = parseLoadProgress(event.data);
-            if (progress) onProgress(progress);
+            onProgress(parseLoadProgress(event.data), event.data);
           }
         }
       } catch { /* skip malformed events */ }
@@ -474,6 +473,7 @@ export async function loadModelAndWait(
 
   // Start SSE watcher in background for instant load detection
   const watchPromise = watchModelEvents(server, targetId, combinedSignal, (progress) => {
+    if (!progress) return;
     onStatus?.(`· ${progress.message}${progress.ratio !== undefined ? ` ${Math.round(progress.ratio * 100)}%` : ""}`);
   });
 

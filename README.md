@@ -47,9 +47,10 @@ Priority order: `LLAMA_SERVER_URL` env → `serverUrl` setting → `127.0.0.1:80
 
 **Zero API calls while pi is idle.** There is no persistent server connection: a per-request watcher runs only between `before_provider_request` and `after_provider_response` (llama-server sends response headers when the prompt is done, so the window covers the whole request). Loads triggered by *other* clients of the same server are never shown.
 
-500ms polling, one initial `/models` probe per request: the request triggered an auto-load (model not loaded / waking from sleep) → polls `/models` and shows `· Loading model 42%` (stages: `fit_params` → `text_model` → `mmproj_model`; no progress data → `· Loading ...`). The watcher stops when the model becomes loaded.
+One initial `/models` probe per request: the request triggered an auto-load (model not loaded / waking from sleep) → an ephemeral `/models/sse` stream provides instant percentage updates (`· Loading model 42%`, stages: `fit_params` → `text_model` → `mmproj_model`), and a slow `/models` heartbeat (2s) is the source of truth — it covers the queueing gap before the first SSE event, sleeping wake-ups, stream drops, and servers without SSE (no progress data → `· Loading ...`). The watcher stops when the model becomes loaded.
 
-- **Update dedup**: status bar only updates when the string changes — polls fire faster than the percentage does
+- **SSE is optional**: progress data only exists in the SSE stream (`/models` never carries it); a missing SSE endpoint degrades to dots-only display
+- **Update dedup**: status bar only updates when the string changes; the heartbeat never overwrites a fresher SSE display
 - **Lifecycle**: the watcher stops on response, on session shutdown, or after a 30-min safety cap; it clears the status slot only if it set it (never clobbers other status content)
 
 The `/llama-load` command has its own progress display (SSE with polling fallback, `loadModelAndWait`) — independent of the watcher.
@@ -101,7 +102,7 @@ Discovered metadata (style + parsed tiers/aliases) is persisted to `llama-metada
 - `thinking-style.ts` — pure style classification + template-derived tier exposure over /props data (no pi dependency)
 - `thinking.ts` — applies the discovered style to Pi model configs (level maps, compat kwargs) and decides `thinking_budget_tokens` injection
 - `sync.ts` — `models.json` sync: alias-based ids (`resolveApiIds`, `modelsJsonApiId` lookup), change detection, debounced write + flush, stale-provider pruning; applies the metadata overlay per model
-- `watch.ts` — per-request progress watcher (auto-load): on-demand `/models` polling with the status-bar display; all pi access via injected `WatchGlue`
+- `watch.ts` — per-request progress watcher (auto-load): ephemeral `/models/sse` percentage updates + `/models` heartbeat as source of truth, status-bar display; all pi access via injected `WatchGlue`
 - `status.ts` — the `/llama-model` overlay: `buildStatusLines` (accepts a pre-fetched `ServerInfo[]`) + border rendering
 - `ext-settings.ts` — loads/patches the `llama-link` namespace of `settings-ext.json` (defaults merge, corrupt-file auto-backup; hosts shared `atomicWrite`)
 
