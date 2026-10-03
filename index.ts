@@ -28,6 +28,8 @@ import {
   resolveServers,
   gatherServers,
   loadModelAndWait,
+  unloadModelOnServer,
+  detectServer,
   ModelInspector,
   matchModel,
   isAutoExposedCacheEntry,
@@ -193,11 +195,15 @@ async function unloadModel(ctx: ExtensionCommandContext): Promise<void> {
 
   const modelId = mode === "router" ? serverModel.id : current.id;
   try {
-    await rpc(server, "/models/unload", { model: modelId });
+    await unloadModelOnServer(server, modelId);
     ctx.ui.notify(`Unloaded ${serverModel.name} from ${server.name}`, "info");
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    ctx.ui.notify(`Failed to unload: ${msg}`, "error");
+    if (msg.includes("HTTP 409")) {
+      ctx.ui.notify(`${server.name}: the model is busy — try again once the current request finishes`, "info");
+    } else {
+      ctx.ui.notify(`Failed to unload: ${msg}`, "error");
+    }
   }
 }
 
@@ -212,6 +218,14 @@ async function loadModelCmd(pi: ExtensionAPI, ctx: ExtensionCommandContext, mode
     await rpc<ModelsResponse>(server, "/models");
   } catch {
     ctx.ui.notify(`${server.name} unreachable`, "error");
+    return;
+  }
+
+  // Strata serves exactly one model per install; loading a different id
+  // would silently load the configured one, so refuse it up front.
+  const kindInfo = await detectServer(server);
+  if (modelArg && kindInfo.kind === "strata" && kindInfo.strataModel && modelArg !== kindInfo.strataModel) {
+    ctx.ui.notify(`${server.name} (Strata) serves one model: ${kindInfo.strataModel} — ${modelArg} is not it`, "error");
     return;
   }
 
@@ -235,7 +249,13 @@ async function loadModelCmd(pi: ExtensionAPI, ctx: ExtensionCommandContext, mode
   }
 
   const inspector = new ModelInspector(server);
-  const models = (await inspector.list()).filter((m) => !isAutoExposedCacheEntry(m));
+  let models = (await inspector.list()).filter((m) => !isAutoExposedCacheEntry(m));
+
+  // Strata lists its model in /models only while the engine is (or was) up;
+  // /health knows the configured id either way.
+  if (models.length === 0 && kindInfo.kind === "strata" && kindInfo.strataModel) {
+    models = [{ id: kindInfo.strataModel, status: { value: "unloaded" } }];
+  }
 
   if (models.length === 0) {
     ctx.ui.notify("No models available on server", "error");

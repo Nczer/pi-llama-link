@@ -20,8 +20,10 @@ export const PROVIDER_NAME = "Llama.cpp";
 export const API_KEY_PLACEHOLDER = "sk-placeholder";
 export const PROVIDER_IDS = ["llama-cpp", "llama-cpp-remote", "llama-server"];
 const apiKeyCache = new Map<string, string>();
+const kindCache = new Map<string, ServerKindInfo>();
 const RPC_TIMEOUT = 2000; // 2s timeout for all server requests
 export const PROPS_TIMEOUT_MS = 120_000; // 2min timeout for /props (model loading can be slow)
+export const STRATA_LOAD_TIMEOUT_MS = 600_000; // Strata POST /load blocks until the engine is ready (minutes, cold)
 
 // ── Server Configs ──────────────────────────────────────────────────────
 
@@ -75,6 +77,23 @@ export interface ModelsResponse {
 }
 
 export type ServerMode = "single" | "router";
+
+// ── Server kind (llama-server vs Strata) ────────────────────────────────
+
+export type ServerKind = "llama-cpp" | "strata";
+
+export interface ServerKindInfo {
+  kind: ServerKind;
+  /** The single model id Strata serves (its configured model), from /health. */
+  strataModel?: string;
+}
+
+export interface HealthResponse {
+  status?: string;
+  model?: string;
+  max_context?: number;
+  loaded?: boolean;
+}
 
 export function detectMode(res: ModelsResponse): ServerMode {
   return res.models ? "single" : "router";
@@ -154,10 +173,30 @@ export function resetSettingsCache(): void {
   cachedSettings = undefined;
 }
 
-/** Drop all module caches (settings + api keys) — used at session shutdown. */
+/** Drop all module caches (settings + api keys + server kind) — used at session shutdown. */
 export function clearCaches(): void {
   cachedSettings = undefined;
   apiKeyCache.clear();
+  kindCache.clear();
+}
+
+/**
+ * Which backend serves a URL: Strata or llama-server. Cached per server.
+ * Signal: Strata's /health carries a `model` field (its single configured
+ * model) that llama-server's `{"status":"ok"}` lacks — and /health answers
+ * while Strata's engine is down, unlike /props (503 until it is up).
+ */
+export async function detectServer(server: ServerConfig): Promise<ServerKindInfo> {
+  const key = `${server.id}\u0000${server.url}`;
+  const cached = kindCache.get(key);
+  if (cached) return cached;
+  let info: ServerKindInfo = { kind: "llama-cpp" };
+  try {
+    const health = await rpc<HealthResponse>(server, "/health");
+    if (typeof health?.model === "string") info = { kind: "strata", strataModel: health.model };
+  } catch {}
+  kindCache.set(key, info);
+  return info;
 }
 
 export function resolveLocalUrl(): string {
@@ -335,7 +374,23 @@ export async function fetchV1Models(server: ServerConfig): Promise<V1ModelInfo[]
 }
 
 export async function loadModel(server: ServerConfig, modelId: string): Promise<void> {
+  if ((await detectServer(server)).kind === "strata") {
+    // Strata: one configured model; POST /load blocks until the engine is
+    // ready (minutes, cold). {} forces POST; Strata ignores the body.
+    await rpc(server, "/load", {}, STRATA_LOAD_TIMEOUT_MS);
+    return;
+  }
   await rpc(server, "/models/load", { model: modelId }, 30_000);
+}
+
+export async function unloadModelOnServer(server: ServerConfig, modelId: string): Promise<void> {
+  if ((await detectServer(server)).kind === "strata") {
+    // Strata: POST /unload stops the engine process (frees RAM + VRAM);
+    // up to ~20 s to exit. Throws HTTP 409 while a request is in flight.
+    await rpc(server, "/unload", {}, 30_000);
+    return;
+  }
+  await rpc(server, "/models/unload", { model: modelId });
 }
 
 // ── SSE + Polling Model Load Detection ──────────────────────────────────
@@ -478,8 +533,10 @@ export async function loadModelAndWait(
   });
 
   try {
-    await loadModel(server, targetId);
+    // Set before loadModel: on Strata the POST /load blocks for minutes,
+    // and the poll below only starts when it returns.
     onStatus?.("· Loading model...");
+    await loadModel(server, targetId);
 
     // Poll until loaded, with SSE events providing early hints.
     // Transient failures (503 while the server is busy, network blips) are

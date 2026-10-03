@@ -23,6 +23,7 @@ import {
   rpc,
   matchModel,
   watchModelEvents,
+  detectServer,
   type ServerConfig,
   type ModelsResponse,
 } from "./server";
@@ -109,6 +110,11 @@ export async function startInflightWatch(opts: {
   const probe = (res.data || []).find((m) => matchModel(m, modelId));
   if (probe?.status?.value === "loaded") return;
 
+  // Strata shows no loading state in /models ("unloaded" until ready), so
+  // while its engine is down a request in flight IS a load in progress.
+  const kind = (await detectServer(server)).kind;
+  if (gen !== generation) return;
+
   startedAt = Date.now();
   showing = false;
   glue = g;
@@ -163,11 +169,12 @@ export async function startInflightWatch(opts: {
       stopInflightWatch(); // load done — nothing left to show
       return;
     }
-    if (value === "loading" || value === "sleeping") {
+    const strataLoading = kind === "strata" && (value === "unloaded" || value === undefined);
+    if (value === "loading" || value === "sleeping" || strataLoading) {
       if (!showing) {
-        const state: LoadProgressState = value === "sleeping"
-          ? { status: "loading" }
-          : { status: "loading", progress: entry?.status?.progress };
+        const state: LoadProgressState = value === "loading"
+          ? { status: "loading", progress: entry?.status?.progress }
+          : { status: "loading" };
         setStatus(formatLoadingProgress(state, theme));
       }
     } else {
