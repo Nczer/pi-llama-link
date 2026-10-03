@@ -33,7 +33,6 @@ import {
   ModelInspector,
   matchModel,
   isAutoExposedCacheEntry,
-  parseSseStream,
   type ServerInfo,
   type ServerMode,
   type ServerConfig,
