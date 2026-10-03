@@ -72,7 +72,8 @@ On `session_start`, syncs model metadata to `~/.pi/agent/models.json`.
 The `session_start` sync reuses a single `/models` fetch per server for both sync and the loaded-model notice:
 
 - **Notice per loaded model**: `Llama.cpp: {model} {status} on {server}` — suffixed `— current model` when it matches the model Pi has selected
-- **Confirm-first switch** when Pi's selected model is a llama-cpp model that isn't loaded while other models are (skipped while a load is in flight): a selector offers the loaded models plus "Keep current model"; choosing one switches Pi's current model. Server state is re-fetched *after* the answer — the dialog can stay open while a load runs (minutes), so a model may have loaded/unloaded in the meantime (switch is skipped when the current model is now loaded or the chosen one isn't). Headless modes (`hasUI` false) fall back to the plain warning
+- **Unreachable server owning the current model** → `Llama.cpp: {server} unreachable — current model {provider}/{id}` (without it the session starts on a dead model with no explanation)
+- **Confirm-first switch** when Pi's current llama model is *unusable* — its own server doesn't answer, or it isn't loaded there — while some reachable server has a model loaded (skipped while a load is in flight). Candidates come from **any** reachable server, so a dead local server plus a loaded remote model still offers the switch; the server name is appended to each option when candidates are not all on the current model's server. Choosing one switches Pi's current model. Server state is re-probed *after* the answer — the dialog can stay open while a load runs (minutes), so a model may have loaded/unloaded or a server may have come back in the meantime (switch is skipped when the current model is now loaded or the chosen one isn't). Headless modes (`hasUI` false) fall back to the plain warning
 - **Model switch plumbing** (used by both `/llama-load` and the session-start switch): `modelsJsonApiId()` (sync.ts) finds the models.json id of a server model; when the model is missing from models.json a fresh sync + flush runs first, then `ctx.modelRegistry.refresh({ providers: [id] })` re-reads models.json (no `/reload` needed) and `pi.setModel()` switches
 
 ## Thinking Support
@@ -137,8 +138,10 @@ The `/llama-model` overlay shows per-server:
 - **Aliases as Pi ids**: models.json uses each model's first alias as the id when present; `/llama-load <alias>`, status display, and `/llama-unload` all resolve aliases against the server's `/models` data.
 - **Metrics parsing**: Prometheus text format — skip `#` comments, split on last space for value.
 - **Load UI**: `/llama-load` with no args shows `ctx.ui.select` picker. With an arg, loads directly.
+- **Load server**: `/llama-load` prefers the server owning the current model, but only while it answers — otherwise it falls back to the reachable ones (one → use it with a warning, several → ask). An explicit id that lives on another reachable server is loaded there instead.
+- **Switch candidates are cross-server**: the session-start offer keys on the current model being unusable (server down or model not loaded), not on which provider the loaded model belongs to.
 
 ## Development
 
-- Tests: `npx vitest run` — module-level tests (`thinking-style`, `thinking`, `server`, `metadata`, `sync`, `watch`, `status`, `ext-settings`), incl. local-HTTP integration for discovery, sync, and the inflight watcher (load phase); the pi glue in `index.ts` is verified in a live session
+- Tests: `npx vitest run` — module-level tests (`thinking-style`, `thinking`, `server`, `metadata`, `sync`, `watch`, `status`, `ext-settings`), incl. local-HTTP integration for discovery, sync, and the inflight watcher (load phase) plus the index.ts switch glue (`session-switch.test.ts`: session-start offer, cross-server candidates, `/llama-load` server choice); the remaining pi glue is verified in a live session
 - Run `pi --extension .../index.ts` and test the hooks and commands in a live session

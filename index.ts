@@ -207,18 +207,57 @@ async function unloadModel(ctx: ExtensionCommandContext): Promise<void> {
   }
 }
 
-async function loadModelCmd(pi: ExtensionAPI, ctx: ExtensionCommandContext, modelArg: string): Promise<void> {
-  const servers = resolveServers();
-  const modelProvider = (ctx.model as any)?.provider;
-  const server = (modelProvider && PROVIDER_IDS.includes(modelProvider))
-    ? servers.find((s) => s.id === modelProvider) || servers[0]
-    : servers[0];
+/**
+ * Which server /llama-load loads on: the provider the current model points
+ * at when it answers, otherwise the reachable ones (single → use it, several
+ * → ask). Pinning is a preference, not a trap: with the pinned server down the
+ * command would be unusable.
+ */
+async function pickLoadServer(
+  ctx: ExtensionCommandContext,
+): Promise<{ server: ServerConfig; info: ServerInfo[] } | undefined> {
+  const info = await gatherServers();
+  const reachable = info.filter((s) => s.ready);
+  const currentProvider = (ctx.model as any)?.provider;
+  const preferred = PROVIDER_IDS.includes(currentProvider || "")
+    ? info.find((s) => s.server.id === currentProvider)
+    : undefined;
 
-  try {
-    await rpc<ModelsResponse>(server, "/models");
-  } catch {
-    ctx.ui.notify(`${server.name} unreachable`, "error");
-    return;
+  if (reachable.length === 0) {
+    ctx.ui.notify(`${preferred?.server.name || "No llama.cpp server"} unreachable`, "error");
+    return undefined;
+  }
+  if (preferred?.ready) return { server: preferred.server, info };
+
+  if (reachable.length === 1) {
+    if (preferred) {
+      ctx.ui.notify(`${preferred.server.name} unreachable — using ${reachable[0].server.name}`, "warning");
+    }
+    return { server: reachable[0].server, info };
+  }
+  const names = reachable.map((s) => s.server.name);
+  const choice = ctx.hasUI ? await ctx.ui.select("Load model on which server:", names) : names[0];
+  if (!choice) return undefined;
+  const picked = reachable.find((s) => s.server.name === choice);
+  return picked ? { server: picked.server, info } : undefined;
+}
+
+async function loadModelCmd(pi: ExtensionAPI, ctx: ExtensionCommandContext, modelArg: string): Promise<void> {
+  const picked = await pickLoadServer(ctx);
+  if (!picked) return;
+  let server = picked.server;
+  const info = picked.info;
+
+  // An explicit id may live on another reachable server
+  if (modelArg) {
+    const has = (s: ServerInfo) => s.models.some((m) => matchModel(m, modelArg));
+    if (!has(info.find((s) => s.server.id === server.id)!)) {
+      const other = info.find((s) => s.ready && has(s));
+      if (other) {
+        ctx.ui.notify(`${modelArg} is on ${other.server.name}, not ${server.name} — loading there`, "info");
+        server = other.server;
+      }
+    }
   }
 
   // Strata serves exactly one model per install; loading a different id
@@ -307,12 +346,22 @@ async function loadModelCmd(pi: ExtensionAPI, ctx: ExtensionCommandContext, mode
 
 // ── Session-start notice ──────────────────────────────────────────────
 
+/** A loaded model on a reachable server, tagged with the server it lives on. */
+interface LoadedCandidate {
+  server: ServerConfig;
+  id: string;
+  name: string;
+  aliases?: string[];
+  status: string;
+}
+
 /**
  * Announce loaded models at session start so the user can see at a glance
  * whether the server's loaded model is the one Pi has selected.
- * When the selected model is a llama-cpp model that isn't loaded while
- * another model is, confirm-first offer to switch Pi to a loaded model
- * (an unloaded-but-free server is not a conflict).
+ * The current model is unusable when its own server doesn't answer or it
+ * isn't loaded there; then every loaded model on a reachable server is a
+ * switch candidate, confirm-first (an unloaded-but-free server is not a
+ * conflict, and neither is a load still in flight).
  */
 async function announceLoadedModels(
   serverInfo: ServerInfo[],
@@ -320,110 +369,136 @@ async function announceLoadedModels(
   pi: ExtensionAPI,
 ): Promise<void> {
   const current = ctx.model;
-  const currentProvider = (current as any)?.provider;
+  const currentProvider = (current as any)?.provider ?? "";
+  const currentId = current?.id ?? "";
+  const llamaCurrent = !!currentId && PROVIDER_IDS.includes(currentProvider);
+
+  const own = llamaCurrent ? serverInfo.find((s) => s.server.id === currentProvider) : undefined;
+  if (own && !own.ready) {
+    // Without this the session starts on a dead model with no explanation
+    ctx.ui.notify(
+      `${PROVIDER_NAME}: ${own.server.name} unreachable — current model ${currentProvider}/${currentId}`,
+      "warning",
+    );
+  }
+
+  const ownInspector = own?.ready && own.mode
+    ? new ModelInspector(own.server, { data: own.models, mode: own.mode })
+    : undefined;
+  const candidates: LoadedCandidate[] = [];
 
   for (const { server, ready, models, mode } of serverInfo) {
     if (!ready || !mode || models.length === 0) continue;
-    const inspector = new ModelInspector(server, { data: models, mode });
-
-    let loaded: Array<{ id: string; name: string; aliases?: string[]; status: string }>;
-    try {
-      loaded = await inspector.loadedModels();
-    } catch {
-      continue;
-    }
-
-    const isCurrent = (m: { id: string; aliases?: string[] }): boolean =>
-      currentProvider === server.id && matchModel(m, current!.id);
+    const inspector = server.id === currentProvider && ownInspector
+      ? ownInspector
+      : new ModelInspector(server, { data: models, mode });
+    const loaded = await inspector.loadedModels().catch(() => []);
 
     for (const m of loaded) {
+      const isCurrent = server.id === currentProvider && matchModel(m, currentId);
       ctx.ui.notify(
-        `${PROVIDER_NAME}: ${m.name} ${m.status} on ${server.name}${isCurrent(m) ? " — current model" : ""}`,
+        `${PROVIDER_NAME}: ${m.name} ${m.status} on ${server.name}${isCurrent ? " — current model" : ""}`,
         "info",
       );
-    }
-
-    // Conflict: selected model belongs to this server's provider but isn't
-    // loaded while another model is — with nothing loaded there is no
-    // conflict to warn about.
-    if (currentProvider === server.id && loaded.length > 0 && !loaded.some(isCurrent)) {
-      const status = await inspector.status(current!.id).catch(() => "unknown");
-      if (status === "loading") continue; // the load may still finish
-      await offerSwitchToLoaded(pi, ctx, server, loaded, current!.id);
-      return; // one prompt per startup
+      if (!isCurrent) candidates.push({ server, ...m });
     }
   }
+
+  // A non-llama current model is the user's choice: announce, never offer
+  if (!llamaCurrent) return;
+
+  // Current model loaded where it belongs → nothing to offer
+  if (ownInspector) {
+    if ((await ownInspector.loadedModels().catch(() => [])).some((m) => matchModel(m, currentId))) return;
+    if ((await ownInspector.status(currentId).catch(() => "unknown")) === "loading") return;
+  }
+
+  // Nothing loaded anywhere → no conflict to resolve
+  if (candidates.length === 0) return;
+  const reason = own && !own.ready
+    ? `current model ${currentId} is on ${own.server.name}, which is unreachable`
+    : `current model ${currentId} is not loaded${own ? ` on ${own.server.name}` : ""}`;
+  await offerSwitchToLoaded(pi, ctx, candidates, { provider: currentProvider, id: currentId }, reason);
 }
 
 /**
- * Confirm-first switch at session start: Pi's current model belongs to this
- * server's provider but isn't loaded while other models are. Server state
- * is re-fetched AFTER the user answers — the dialog stays up while loads
- * run (minutes for big models), so state may have changed in the meantime.
+ * Confirm-first switch at session start: the current model is unusable while
+ * other models are loaded (possibly on another server). Server state is
+ * re-probed AFTER the user answers — the dialog stays up while loads run
+ * (minutes for big models) and a down server may have come back.
  */
 async function offerSwitchToLoaded(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
-  server: ServerConfig,
-  loaded: Array<{ id: string; name: string; aliases?: string[]; status: string }>,
-  currentId: string,
+  candidates: LoadedCandidate[],
+  current: { provider: string; id: string },
+  reason: string,
 ): Promise<void> {
   if (!ctx.hasUI) {
-    ctx.ui.notify(
-      `${PROVIDER_NAME}: ${currentId} not loaded on ${server.name} -- /llama-load ${currentId}`,
-      "warning",
-    );
+    ctx.ui.notify(`${PROVIDER_NAME}: ${reason} -- /llama-load ${current.id}`, "warning");
     return;
   }
 
-  // Disambiguate duplicate display names so each option maps 1:1 to a model
+  // Disambiguate duplicate display names so each option maps 1:1 to a model;
+  // name the server when candidates span several of them or sit on another
+  // one than the current model's
+  const multiServer =
+    new Set(candidates.map((c) => c.server.id)).size > 1 ||
+    candidates.some((c) => c.server.id !== current.provider);
   const nameCounts = new Map<string, number>();
-  for (const m of loaded) {
-    const name = m.aliases?.[0] || m.id;
+  for (const c of candidates) {
+    const name = c.aliases?.[0] || c.id;
     nameCounts.set(name, (nameCounts.get(name) || 0) + 1);
   }
-  const labelOf = (m: { id: string; aliases?: string[] }): string => {
-    const name = m.aliases?.[0] || m.id;
-    return (nameCounts.get(name) || 0) > 1 ? `${name} (${m.id})` : name;
+  const labelOf = (c: LoadedCandidate): string => {
+    const name = c.aliases?.[0] || c.id;
+    const base = (nameCounts.get(name) || 0) > 1 ? `${name} (${c.id})` : name;
+    return multiServer ? `${base} — ${c.server.name}` : base;
   };
   const KEEP = "Keep current model";
 
   let choice: string | undefined;
   try {
     choice = await ctx.ui.select(
-      `${PROVIDER_NAME}: current model ${currentId} is not loaded on ${server.name} — switch?`,
-      [...loaded.map(labelOf), KEEP],
+      `${PROVIDER_NAME}: ${reason} — switch?`,
+      [...candidates.map(labelOf), KEEP],
     );
   } catch {
     return; // dialog unavailable (stale context) — keep current
   }
   if (!choice || choice === KEEP) return;
-  const target = loaded.find((m) => labelOf(m) === choice);
+  const target = candidates.find((c) => labelOf(c) === choice);
   if (!target) return;
 
-  // Race guard: re-fetch server state (something may have loaded/unloaded
-  // while the dialog was open).
-  let fresh: ModelsResponse;
-  try {
-    fresh = await rpc<ModelsResponse>(server, "/models");
-  } catch {
-    ctx.ui.notify(`${server.name} unreachable — kept current model`, "warning");
+  // Race guard: re-probe every server (something may have loaded, unloaded,
+  // or come back while the dialog was open).
+  const fresh = await gatherServers();
+  const freshOwn = fresh.find((s) => s.server.id === current.provider);
+  if (freshOwn?.ready && freshOwn.mode) {
+    const ownLoaded = await new ModelInspector(freshOwn.server, {
+      data: freshOwn.models,
+      mode: freshOwn.mode,
+    }).loadedModels().catch(() => []);
+    if (ownLoaded.some((m) => matchModel(m, current.id))) {
+      ctx.ui.notify(`${PROVIDER_NAME}: ${current.id} loaded in the meantime — kept current model`, "info");
+      return;
+    }
+  }
+  const freshServer = fresh.find((s) => s.server.id === target.server.id);
+  if (!freshServer?.ready || !freshServer.mode) {
+    ctx.ui.notify(`${target.server.name} unreachable — kept current model`, "warning");
     return;
   }
-  const freshLoaded = await new ModelInspector(server, {
-    data: fresh.data || [],
-    mode: detectMode(fresh),
+  const freshLoaded = await new ModelInspector(freshServer.server, {
+    data: freshServer.models,
+    mode: freshServer.mode,
   }).loadedModels().catch(() => []);
-  if (freshLoaded.some((m) => matchModel(m, currentId))) {
-    ctx.ui.notify(`${PROVIDER_NAME}: ${currentId} loaded in the meantime — kept current model`, "info");
-    return;
-  }
   const freshTarget = freshLoaded.find((m) => m.id === target.id);
   if (!freshTarget) {
     ctx.ui.notify(`${PROVIDER_NAME}: ${target.name} no longer loaded — kept current model`, "warning");
     return;
   }
-  await switchPiModel(pi, ctx, server, freshTarget);
+  await switchPiModel(pi, ctx, freshServer.server, freshTarget);
 }
 
 // ── Extension Entry ───────────────────────────────────────────────────
@@ -529,7 +604,7 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
       void startInflightWatch({ server, modelId: model.id, ctx, glue: watchGlue });
     }
 
-    const budget = thinkingBudgetFor(model, pi.getThinkingLevel());
+    const budget = thinkingBudgetFor(model!, pi.getThinkingLevel());
     if (budget === undefined) return;
 
     return {
