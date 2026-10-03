@@ -360,8 +360,8 @@ interface LoadedCandidate {
  * whether the server's loaded model is the one Pi has selected.
  * The current model is unusable when its own server doesn't answer or it
  * isn't loaded there; then every loaded model on a reachable server is a
- * switch candidate, confirm-first (an unloaded-but-free server is not a
- * conflict, and neither is a load still in flight).
+ * switch candidate (an unloaded-but-free server is not a conflict, and
+ * neither is a load still in flight).
  */
 async function announceLoadedModels(
   serverInfo: ServerInfo[],
@@ -418,60 +418,41 @@ async function announceLoadedModels(
   const reason = own && !own.ready
     ? `current model ${currentId} is on ${own.server.name}, which is unreachable`
     : `current model ${currentId} is not loaded${own ? ` on ${own.server.name}` : ""}`;
-  await offerSwitchToLoaded(pi, ctx, candidates, { provider: currentProvider, id: currentId }, reason);
+  await autoSwitchToLoaded(pi, ctx, candidates, { provider: currentProvider, id: currentId }, reason);
 }
 
 /**
- * Confirm-first switch at session start: the current model is unusable while
- * other models are loaded (possibly on another server). Server state is
- * re-probed AFTER the user answers — the dialog stays up while loads run
- * (minutes for big models) and a down server may have come back.
+ * Session-start switch: switch to a loaded model and report it — no dialog.
+ * Confirming a state the user has just watched being announced, with one
+ * obviously better answer (the current model works nowhere else), is a prompt
+ * for its own sake.
+ *
+ * Candidate ranking is deterministic and the notification states what was
+ * picked: a model on the current model's own server first (switching inside
+ * one server changes less than switching servers), otherwise probe order —
+ * server order as configured, then that server's own model-list order.
+ *
+ * Headless does nothing: `ctx.ui.notify` is a no-op there, and changing the
+ * model of a run nobody is watching is worse than leaving it alone.
+ *
+ * Server state is re-probed before the switch: a load may have finished
+ * (minutes for big models), a model may have unloaded, or a down server may
+ * have come back since the announce.
  */
-async function offerSwitchToLoaded(
+async function autoSwitchToLoaded(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   candidates: LoadedCandidate[],
   current: { provider: string; id: string },
   reason: string,
 ): Promise<void> {
-  if (!ctx.hasUI) {
-    ctx.ui.notify(`${PROVIDER_NAME}: ${reason} -- /llama-load ${current.id}`, "warning");
-    return;
-  }
+  if (!ctx.hasUI) return;
 
-  // Disambiguate duplicate display names so each option maps 1:1 to a model;
-  // name the server when candidates span several of them or sit on another
-  // one than the current model's
-  const multiServer =
-    new Set(candidates.map((c) => c.server.id)).size > 1 ||
-    candidates.some((c) => c.server.id !== current.provider);
-  const nameCounts = new Map<string, number>();
-  for (const c of candidates) {
-    const name = c.aliases?.[0] || c.id;
-    nameCounts.set(name, (nameCounts.get(name) || 0) + 1);
-  }
-  const labelOf = (c: LoadedCandidate): string => {
-    const name = c.aliases?.[0] || c.id;
-    const base = (nameCounts.get(name) || 0) > 1 ? `${name} (${c.id})` : name;
-    return multiServer ? `${base} — ${c.server.name}` : base;
-  };
-  const KEEP = "Keep current model";
-
-  let choice: string | undefined;
-  try {
-    choice = await ctx.ui.select(
-      `${PROVIDER_NAME}: ${reason} — switch?`,
-      [...candidates.map(labelOf), KEEP],
-    );
-  } catch {
-    return; // dialog unavailable (stale context) — keep current
-  }
-  if (!choice || choice === KEEP) return;
-  const target = candidates.find((c) => labelOf(c) === choice);
+  const target = candidates.find((c) => c.server.id === current.provider) ?? candidates[0];
   if (!target) return;
 
-  // Race guard: re-probe every server (something may have loaded, unloaded,
-  // or come back while the dialog was open).
+  // Race guard: re-probe every server (loads, unloads and reconnects happen
+  // while the announce and the probes run).
   const fresh = await gatherServers();
   const freshOwn = fresh.find((s) => s.server.id === current.provider);
   if (freshOwn?.ready && freshOwn.mode) {
@@ -498,7 +479,14 @@ async function offerSwitchToLoaded(
     ctx.ui.notify(`${PROVIDER_NAME}: ${target.name} no longer loaded — kept current model`, "warning");
     return;
   }
-  await switchPiModel(pi, ctx, freshServer.server, freshTarget);
+  const ok = await switchPiModel(pi, ctx, freshServer.server, freshTarget);
+  if (ok) {
+    const label = freshTarget.aliases?.[0] || freshTarget.id;
+    ctx.ui.notify(
+      `${PROVIDER_NAME}: switched to ${label} on ${freshServer.server.name} — ${reason}`,
+      "info",
+    );
+  }
 }
 
 // ── Extension Entry ───────────────────────────────────────────────────

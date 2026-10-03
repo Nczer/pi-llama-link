@@ -1,9 +1,10 @@
 /**
- * index.ts model-switching glue: the session-start offer (the current model is
- * unusable when its own server doesn't answer or it isn't loaded there, and any
- * loaded model on a reachable server is then a candidate, cross-server) and the
- * /llama-load server choice (pinned to the current model's provider only while
- * that server answers).
+ * index.ts model-switching glue: the session-start auto-switch (the current
+ * model is unusable when its own server doesn't answer or it isn't loaded
+ * there, and any loaded model on a reachable server is then a candidate,
+ * cross-server — picked deterministically, no dialog) and the /llama-load
+ * server choice (pinned to the current model's provider only while that
+ * server answers).
  *
  * HOME is redirected to a temp dir BEFORE importing index.ts (settings,
  * models.json and the metadata store are HOME-bound).
@@ -73,6 +74,7 @@ async function run(
   model: { provider: string; id: string },
   cmd?: [string, string],
   pick?: (options: string[]) => string | undefined,
+  hasUI = true,
 ): Promise<Run> {
   const handlers: Record<string, any> = {};
   const commands: Record<string, any> = {};
@@ -89,13 +91,16 @@ async function run(
   let dialog: Run["dialog"];
   const ctx: any = {
     model,
-    hasUI: true,
+    hasUI,
     ui: {
-      notify: (m: string, t?: string) => { notices.push(`${t ?? "info"}: ${m}`); },
-      select: async (q: string, opts: string[]) => {
-        dialog = { question: q, options: opts };
-        return pick ? pick(opts) : opts[0];
-      },
+      // Mirrors pi's noOpUIContext: a headless run has no notify to hear.
+      notify: hasUI ? (m: string, t?: string) => { notices.push(`${t ?? "info"}: ${m}`); } : () => {},
+      select: hasUI
+        ? async (q: string, opts: string[]) => {
+            dialog = { question: q, options: opts };
+            return pick ? pick(opts) : opts[0];
+          }
+        : async () => undefined,
       setStatus: () => {},
       theme: undefined,
     },
@@ -114,33 +119,54 @@ async function run(
 const portOf = (url: string) => url.replace(/^https?:\/\//, "");
 
 describe("session-start switch", () => {
-  it("offers a loaded model on another server when the current one is unreachable", async () => {
+  it("switches to a loaded model on another server when the current one is unreachable", async () => {
     const live = await fakeRouter({ m1: "unloaded", m2: "loaded" });
     useSettings(DEAD, live);
     const r = await run({ provider: "llama-cpp", id: "m1" });
 
     expect(r.notices).toContain(`warning: Llama.cpp: Local (${portOf(DEAD)}) unreachable — current model llama-cpp/m1`);
-    expect(r.dialog?.options).toEqual([`m2 — Remote (${portOf(live)})`, "Keep current model"]);
+    expect(r.notices).toContain(
+      `info: Llama.cpp: switched to m2 on Remote (${portOf(live)}) — current model m1 is on Local (${portOf(DEAD)}), which is unreachable`,
+    );
     expect(r.setModels).toEqual(["llama-cpp-remote/m2"]);
   });
 
-  it("keeps the current model when the user declines", async () => {
+  it("never asks — the switch is a notification, not a dialog", async () => {
     const live = await fakeRouter({ m1: "unloaded", m2: "loaded" });
     useSettings(DEAD, live);
-    const r = await run({ provider: "llama-cpp", id: "m1" }, undefined, (o) => o[o.length - 1]);
-    expect(r.setModels).toEqual([]);
+    const r = await run({ provider: "llama-cpp", id: "m1" });
+    expect(r.dialog).toBeUndefined();
   });
 
-  it("still offers same-server switches (no server suffix when one server is involved)", async () => {
+  it("prefers a loaded model on the current model's own server over a remote one", async () => {
+    // Switching inside one server changes less than switching servers.
+    const own = await fakeRouter({ m1: "unloaded", m2: "loaded" });
+    const remote = await fakeRouter({ m3: "loaded" });
+    useSettings(own, remote);
+    const r = await run({ provider: "llama-cpp", id: "m1" });
+    expect(r.setModels).toEqual(["llama-cpp/m2"]);
+    expect(r.notices).toContain(
+      `info: Llama.cpp: switched to m2 on Local (${portOf(own)}) — current model m1 is not loaded on Local (${portOf(own)})`,
+    );
+  });
+
+  it("switches same-server when the current model simply isn't loaded", async () => {
     const live = await fakeRouter({ m1: "unloaded", m2: "loaded" });
     useSettings(live, null);
     const r = await run({ provider: "llama-cpp", id: "m1" });
-    expect(r.dialog?.options).toEqual(["m2", "Keep current model"]);
     expect(r.setModels).toEqual(["llama-cpp/m2"]);
     expect(r.notices.some((n) => /unreachable/.test(n))).toBe(false);
   });
 
-  it("offers nothing when the current model is loaded where it belongs", async () => {
+  it("headless switches nothing and says nothing (notify is a no-op there)", async () => {
+    const live = await fakeRouter({ m1: "unloaded", m2: "loaded" });
+    useSettings(DEAD, live);
+    const r = await run({ provider: "llama-cpp", id: "m1" }, undefined, undefined, false);
+    expect(r.setModels).toEqual([]);
+    expect(r.notices).toEqual([]);
+  });
+
+  it("switches nothing when the current model is loaded where it belongs", async () => {
     const live = await fakeRouter({ m1: "unloaded", m2: "loaded" });
     useSettings(live, null);
     const r = await run({ provider: "llama-cpp", id: "m2" });
@@ -149,7 +175,7 @@ describe("session-start switch", () => {
     expect(r.notices).toContain(`info: Llama.cpp: m2 loaded on Local (${portOf(live)}) — current model`);
   });
 
-  it("waits instead of offering while the current model is still loading", async () => {
+  it("waits instead of switching while the current model is still loading", async () => {
     const live = await fakeRouter({ m1: "loading", m2: "loaded" });
     useSettings(live, null);
     const r = await run({ provider: "llama-cpp", id: "m1" });
@@ -157,7 +183,7 @@ describe("session-start switch", () => {
     expect(r.setModels).toEqual([]);
   });
 
-  it("announces loaded models but never offers for a non-llama current model", async () => {
+  it("announces loaded models but never switches for a non-llama current model", async () => {
     const live = await fakeRouter({ m1: "unloaded", m2: "loaded" });
     useSettings(DEAD, live);
     const r = await run({ provider: "anthropic", id: "claude" });
