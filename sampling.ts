@@ -238,6 +238,9 @@ export function setSampling(
 ): boolean {
   const provider = config.providers[providerId];
   if (!provider) return false;
+  // Reported honestly: the caller writes models.json on a true return, so a call
+  // that changes nothing has to say so
+  const before = JSON.stringify(provider.modelOverrides?.[modelId] ?? null);
   if (!provider.modelOverrides) provider.modelOverrides = {};
   const entry = provider.modelOverrides[modelId] || (provider.modelOverrides[modelId] = {});
 
@@ -262,7 +265,7 @@ export function setSampling(
     delete provider.modelOverrides[modelId];
     if (!Object.keys(provider.modelOverrides).length) delete provider.modelOverrides;
   }
-  return true;
+  return JSON.stringify(provider.modelOverrides?.[modelId] ?? null) !== before;
 }
 
 export function carriesSampling(entry: any): boolean {

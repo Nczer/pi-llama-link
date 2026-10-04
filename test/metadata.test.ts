@@ -7,7 +7,7 @@
  * the METADATA_JSON path binds at module load.
  */
 import { describe, it, expect, afterAll, beforeAll } from "vitest";
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import http from "node:http";
@@ -38,6 +38,15 @@ describe("loadMetadataOverlay", () => {
 });
 
 describe("persistModelMetadata", () => {
+  it("an identical re-persist does not rewrite the file", async () => {
+    writeFileSync(metadataFile, JSON.stringify({ "llama-cpp": { "m1": { thinking: "toggle" } } }));
+    const before = statSync(metadataFile).mtimeMs;
+    await new Promise((r) => setTimeout(r, 20));
+    md.persistModelMetadata("llama-cpp", "m1", { thinking: "toggle" });
+    md.flushMetadataWrite();
+    expect(statSync(metadataFile).mtimeMs).toBe(before);
+    rmSync(metadataFile);
+  });
   it("merges into existing entries (no full replace)", () => {
     writeFileSync(metadataFile, JSON.stringify({ "llama-cpp": { "m1": { thinking: "toggle" } } }));
     md.persistModelMetadata("llama-cpp", "m1", { contextWindow: 8192 });

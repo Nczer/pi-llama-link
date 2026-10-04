@@ -134,7 +134,11 @@ export function persistModelMetadata(serverId: string, modelId: string, data: Mo
   const overlay = loadMetadataOverlay();
   if (!overlay[serverId]) overlay[serverId] = {};
   const existing = overlay[serverId][modelId] || {};
-  overlay[serverId][modelId] = { ...existing, ...data };
+  const merged = { ...existing, ...data };
+  // /props answers the same way every session; re-persisting what is already
+  // stored must not rewrite the file
+  if (JSON.stringify(merged) === JSON.stringify(existing)) return;
+  overlay[serverId][modelId] = merged;
   saveMetadataOverlay(overlay);
 }
 

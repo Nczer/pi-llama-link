@@ -70,10 +70,11 @@ Syncs model metadata to `~/.pi/agent/models.json` whenever models are needed —
 - Persisted metadata (`llama-metadata.json`) is re-keyed from old real ids to alias ids on sync, so thinking/context overrides survive
 - Sampling config (`samplingParams`, `samplingParamsByThinkingLevel`) already on a model entry is carried into the rebuilt entry, and `modelOverrides` is spread untouched — a sync never drops tuning
 - Skips write if model list and context windows are unchanged
+- **Nothing is rewritten without a change**: `modelsChanged()` gates a sync, `setSampling` reports no change when the value is already there or there is nothing to clear, `persistModelMetadata` skips an identical re-persist (the same `/props` answer every session), `patchExtSettings`/`loadExtSettings` skip a patch that changes nothing
 - Each server writes under its own provider key
 - Filters out auto-exposed HF cache entries (undefined models like `unsloth/Qwen3.6-27B-MTP-GGUF:Q4_K_XL`)
 - Removes provider entries for servers no longer configured (e.g., remote URL unset)
-- **Parse tolerance**: `models.json` is read with JSON comments and a BOM stripped (same treatment pi gives it), so a hand-annotated file is not mistaken for an empty one. When the file still cannot be parsed, every writer (`sync`, `/llama-sampling`) leaves it alone and reports the problem instead of rewriting it
+- **Parse tolerance**: `models.json` is read with JSON comments and a BOM stripped (same treatment pi gives it), so a hand-annotated file is not mistaken for an empty one. When the file still cannot be parsed, every writer (`sync`, `/llama-sampling`) leaves it alone and reports the problem instead of rewriting it. Note that a write that *does* happen re-serializes the file, so hand-written comments in it are not preserved
 
 ## Session Start
 

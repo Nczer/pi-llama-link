@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadExtSettings, patchExtSettings } from "../ext-settings";
@@ -69,6 +69,14 @@ describe("patchExtSettings", () => {
     patchExtSettings("llama-link", { remoteUrl: undefined }, file);
     const raw = JSON.parse(readFileSync(file, "utf8"));
     expect(raw["llama-link"].remoteUrl).toBeUndefined();
+  });
+
+  it("a patch that changes nothing leaves the file alone", async () => {
+    writeFileSync(file, JSON.stringify({ other: { a: 1 }, "llama-link": { serverUrl: "http://127.0.0.1:8080" } }));
+    const before = statSync(file).mtimeMs;
+    await new Promise((r) => setTimeout(r, 20));
+    patchExtSettings("llama-link", { serverUrl: "http://127.0.0.1:8080" }, file);
+    expect(statSync(file).mtimeMs).toBe(before);
   });
 
   it("creates the namespace when absent", () => {

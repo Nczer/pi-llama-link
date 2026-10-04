@@ -189,6 +189,18 @@ describe("setSampling", () => {
     setSampling(config, "llama-cpp", "m1", "all", "temperature", undefined);
     expect(config.providers["llama-cpp"].modelOverrides).toBeUndefined();
   });
+  it("reports no change when the value is already there (no needless write)", () => {
+    const config = base();
+    const snapshot = JSON.parse(JSON.stringify(config));
+    expect(setSampling(config, "llama-cpp", "m1", "all", "temperature", 1)).toBe(false);
+    expect(JSON.stringify(config)).toBe(JSON.stringify(snapshot));
+  });
+  it("reports no change when there is nothing to clear", () => {
+    const config = base();
+    const snapshot = JSON.parse(JSON.stringify(config));
+    expect(setSampling(config, "llama-cpp", "m1", "high", "top_k", undefined)).toBe(false);
+    expect(JSON.stringify(config)).toBe(JSON.stringify(snapshot));
+  });
   it("keeping a non-sampling override key is left alone", () => {
     const config = { providers: { "llama-cpp": { models: [{ id: "m1" }], modelOverrides: { m1: { contextWindow: 4096 } } } } };
     setSampling(config, "llama-cpp", "m1", "all", "temperature", undefined);
