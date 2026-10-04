@@ -114,8 +114,16 @@ describe("buildStatusLines", () => {
     expect(lines[lines.length - 1]).toBe("Remote (r:1) — ⬛ offline");
   });
 
-  it("non-llama current model → no active markers", async () => {
-    const lines = await buildStatusLines({ id: "gpt", provider: "other" } as any, [routerServer]);
+  it("sampling line goes under the active model only", async () => {
+    const lines = await buildStatusLines({ id: "short", provider: "llama-cpp" } as any, [routerServer], "Sampling [off]: temp 0.80 · top_k 40");
+    expect(lines[3]).toBe("     Sampling [off]: temp 0.80 · top_k 40");
+    expect(lines.filter((l) => l.includes("Sampling [")).length).toBe(1);
+  });
+
+  it("non-llama current model → no active markers, no sampling line", async () => {
+    const lines = await buildStatusLines({ id: "gpt", provider: "other" } as any, [routerServer], "Sampling [off]: temp 0.80");
+    expect(lines.some((l) => l.includes("Sampling ["))).toBe(false);
+
     expect(lines.some((l) => l.includes("✓ active"))).toBe(false);
     expect(lines.some((l) => l.includes("← active"))).toBe(false);
   });

@@ -2,6 +2,7 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
+  ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
 import { thinkingBudgetFor } from "./thinking";
 import { showStatus, STATUS_ICONS } from "./status";
@@ -14,9 +15,32 @@ import {
   discoverModelMetadata,
   flushMetadataWrite,
   resetDiscoveryState,
+  loadMetadataOverlay,
 } from "./metadata";
 import { patchExtSettings } from "./ext-settings";
-import { syncToModelsJson, flushModelsWrite, modelsJsonApiId } from "./sync";
+import {
+  syncToModelsJson,
+  flushModelsWrite,
+  modelsJsonApiId,
+  readModelsJson,
+  patchModelsJson,
+  modelsJsonUnreadable,
+} from "./sync";
+import {
+  SAMPLING_KEYS,
+  exposedLevels,
+  effectiveLevel,
+  effectiveSampling,
+  effectiveOverride,
+  setSampling,
+  parseSamplingValue,
+  describeOverride,
+  formatSampling,
+  samplingStatusLine,
+  num,
+  type SamplingKey,
+  type SamplingTarget,
+} from "./sampling";
 import {
   PROVIDER_NAME,
   PROVIDER_IDS,
@@ -498,11 +522,193 @@ const watchGlue: WatchGlue = {
   setStatus: (ctx, value) => setLlamaStatus(ctx as ExtensionContext, value),
 };
 
+// ── Sampling Tuning ───────────────────────────────────────────────
+// The tuning itself lives in models.json modelOverrides (user-owned, pi merges
+// it last); sampling.ts owns the semantics, this is the UI and the live apply.
+
+const SAMPLING_HINTS: Record<SamplingKey, string> = {
+  temperature: "0 = greedy · 1 = neutral · higher = more random",
+  top_p: "> 0 and <= 1 · 1 = no truncation",
+  top_k: "whole number · 0 = full vocabulary",
+  min_p: "0..1 · 0 = off",
+};
+
+/**
+ * pi exposes its settings read-only to extensions (getSettings), which is where
+ * the per-model thinking level defaults live. The type package pinned here
+ * predates that method, so it is reached through a narrow local type; a pi
+ * without it degrades to "no per-model default" rather than failing.
+ */
+function piThinkingSettings(pi: ExtensionAPI): {
+  defaultThinkingLevel?: string;
+  modelThinkingLevels?: Record<string, string>;
+} {
+  const get = (pi as { getSettings?: () => any }).getSettings;
+  try {
+    return typeof get === "function" ? get.call(pi) ?? {} : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Overlay line for the current model: file reads only, never an API call. */
+function samplingLineFor(pi: ExtensionAPI, model: ProviderModelConfig | undefined): string | undefined {
+  const providerId = (model as any)?.provider;
+  if (!model || !PROVIDER_IDS.includes(providerId)) return undefined;
+  const override = effectiveOverride(readModelsJson(), providerId, model.id);
+  const defaults = loadMetadataOverlay()[providerId]?.[model.id]?.sampling;
+  const { level } = effectiveLevel(
+    model as Record<string, any>, providerId, model.id,
+    piThinkingSettings(pi), pi.getThinkingLevel(),
+  );
+  return samplingStatusLine(override, defaults, level);
+}
+
+/**
+ * Make a models.json sampling change take effect in this session: the Model
+ * object pi holds was composed before the write, so re-read the provider and
+ * select the model again. setModel re-derives the thinking level from settings,
+ * so the session level is restored afterwards.
+ */
+async function reapplyModel(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  providerId: string,
+  modelId: string,
+): Promise<boolean> {
+  const levelBefore = pi.getThinkingLevel();
+  await ctx.modelRegistry.refresh({ providers: [providerId] }).catch(() => {});
+  const fresh = ctx.modelRegistry.find(providerId, modelId);
+  if (!fresh) return false;
+  if (!(await pi.setModel(fresh))) return false;
+  if (pi.getThinkingLevel() !== levelBefore) pi.setThinkingLevel(levelBefore);
+  return true;
+}
+
+async function samplingCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+  const current = ctx.model;
+  const providerId = (current as any)?.provider;
+  if (!current || !PROVIDER_IDS.includes(providerId)) {
+    ctx.ui.notify(`Current model is not ${PROVIDER_NAME} — switch to a ${PROVIDER_NAME} model first`, "error");
+    return;
+  }
+
+  const config = readModelsJson();
+  const entries: any[] = config.providers[providerId]?.models || [];
+  if (entries.length === 0 || modelsJsonUnreadable()) {
+    ctx.ui.notify(
+      modelsJsonUnreadable()
+        ? "models.json could not be parsed — fix it before tuning sampling"
+        : `${current.id} missing from models.json — /llama-sync first`,
+      "error",
+    );
+    return;
+  }
+
+  // The composed model carries thinkingLevelMap/reasoning, which is what
+  // decides the levels pi can use; fall back to the models.json entry
+  let modelId = current.id;
+  if (entries.length > 1) {
+    const ids = [current.id, ...entries.filter((e) => e.id !== current.id).map((e) => e.id)];
+    const choice = await ctx.ui.select("Sampling: which model? (current model first)", ids);
+    if (!choice || !ids.includes(choice)) return;
+    modelId = choice;
+  }
+  const model =
+    ctx.modelRegistry.find(providerId, modelId) ?? entries.find((e) => e.id === modelId);
+  if (!model) {
+    ctx.ui.notify(`${modelId} not found in the model registry — /llama-sync then /reload`, "error");
+    return;
+  }
+
+  const override = effectiveOverride(config, providerId, modelId);
+  const defaults = loadMetadataOverlay()[providerId]?.[modelId]?.sampling;
+  const { level, source, clampedFrom } = effectiveLevel(
+    model as Record<string, any>, providerId, modelId,
+    piThinkingSettings(pi), pi.getThinkingLevel(),
+  );
+  const levelNote = clampedFrom
+    ? `${level} (settings say "${clampedFrom}", the model does not expose it)`
+    : `${level} (${source})`;
+
+  // Which level to tune. Only exposed levels are offered: pi clamps the
+  // requested level before looking it up, so an entry for a hidden level never
+  // applies and would look like a tuning that does nothing.
+  const targets: SamplingTarget[] = ["all", ...exposedLevels(model as Record<string, any>)];
+  const targetItems = targets.map((t) =>
+    t === "all"
+      ? `all levels — ${formatSampling(effectiveSampling(override, defaults, level)) || "server defaults"}`
+      : `${t} — ${formatSampling(effectiveSampling(override, defaults, t)) || "server defaults"}`,
+  );
+  const chosenTarget = await ctx.ui.select(
+    [
+      `Sampling · ${modelId}`,
+      `runs at ${levelNote} · tuned: ${describeOverride(override)} · server: ${defaults ? formatSampling(defaults) : "unknown (no /props read yet)"}`,
+    ].join("\n"),
+    targetItems,
+  );
+  const targetIndex = targetItems.indexOf(chosenTarget ?? "");
+  if (targetIndex < 0) return;
+  const target = targets[targetIndex];
+
+  // Show the tuned value and, underneath it, what the server would have used
+  const readLevel: SamplingTarget = target === "all" ? level : target;
+  const tunedOf = (key: SamplingKey): number | undefined =>
+    target === "all"
+      ? override?.samplingParams?.[key]
+      : override?.samplingParamsByThinkingLevel?.[target]?.[key];
+  const keyItems = SAMPLING_KEYS.map((key) => {
+    const tuned = tunedOf(key);
+    if (tuned !== undefined) return `${key} = ${num(tuned)}`;
+    const inherited = effectiveSampling(override, defaults, readLevel)[key];
+    if (inherited !== undefined) return `${key} = ${num(inherited)} (${target === "all" ? "server" : "from all levels/server"})`;
+    return `${key} — unset`;
+  });
+  const chosenKey = await ctx.ui.select(
+    `${modelId} · ${target === "all" ? "all levels" : `${target} thinking`}`,
+    keyItems,
+  );
+  const keyIndex = keyItems.indexOf(chosenKey ?? "");
+  if (keyIndex < 0) return;
+  const key = SAMPLING_KEYS[keyIndex];
+
+  const raw = await ctx.ui.input(`${key}: new value (empty clears this level's override)`, SAMPLING_HINTS[key]);
+  if (raw === undefined) return;
+  let value: number | undefined;
+  if (raw.trim()) {
+    const parsed = parseSamplingValue(key, raw);
+    if (parsed.error || parsed.value === undefined) {
+      ctx.ui.notify(parsed.error ?? "invalid value", "error");
+      return;
+    }
+    value = parsed.value;
+  }
+
+  const label = `${modelId} · ${target === "all" ? "all levels" : target} · ${key}`;
+  const changed = patchModelsJson((cfg) => setSampling(cfg, providerId, modelId, target, key, value));
+  if (!changed) {
+    ctx.ui.notify(
+      modelsJsonUnreadable()
+        ? "models.json could not be parsed — nothing written"
+        : `${label}: no change`,
+      modelsJsonUnreadable() ? "error" : "info",
+    );
+    return;
+  }
+  const written = value === undefined ? `${label} cleared` : `${label} = ${num(value)}`;
+  if (modelId !== current.id) {
+    ctx.ui.notify(`${written} — applies when you switch to ${modelId}`, "info");
+    return;
+  }
+  const applied = await reapplyModel(pi, ctx, providerId, modelId);
+  ctx.ui.notify(`${written} — ${applied ? "applied to this session" : "saved; /reload to apply"}`, applied ? "info" : "warning");
+}
+
 export default function llamaLinkExtension(pi: ExtensionAPI) {
   pi.registerCommand("llama-model", {
     description: `${PROVIDER_NAME} status indicator`,
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      await showStatus(ctx);
+      await showStatus(ctx, samplingLineFor(pi, ctx.model));
     },
   });
 
@@ -524,7 +730,18 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     description: `Sync ${PROVIDER_NAME} models to models.json`,
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
       const wrote = await syncToModelsJson();
+      if (modelsJsonUnreadable()) {
+        ctx.ui.notify("models.json could not be parsed — left untouched, fix it first", "error");
+        return;
+      }
       ctx.ui.notify(wrote ? `${PROVIDER_NAME} models synced` : `${PROVIDER_NAME} models already up to date`, "info");
+    },
+  });
+
+  pi.registerCommand("llama-sampling", {
+    description: `Tune ${PROVIDER_NAME} sampling per thinking level`,
+    handler: async (_args: string, ctx: ExtensionCommandContext) => {
+      await samplingCommand(pi, ctx);
     },
   });
 

@@ -112,6 +112,7 @@ export function formatMetrics(m: MetricsData): string[] {
 export async function buildStatusLines(
   current: ProviderModelConfig | undefined,
   serverInfo?: ServerInfo[],
+  samplingLine?: string,
 ): Promise<string[]> {
   const info = serverInfo ?? (await gatherServers());
   const currentProvider = (current as any)?.provider;
@@ -149,6 +150,10 @@ export async function buildStatusLines(
 
       lines.push(`  ${icon} ${name} (${status})${isActive ? " ✓ active" : ""}`);
       lines.push(`     Context: ${contextSize === null ? "unknown" : contextSize.toLocaleString()} tokens · Input: ${caps.join(", ")}`);
+      // Sampling in effect for the active model only — values the request will
+      // actually carry, not a per-model list (file reads only, so a sleeping
+      // model is safe to annotate)
+      if (isActive && samplingLine) lines.push(`     ${samplingLine}`);
 
       // Skip live endpoints for sleeping models — they wake the model on the router
       if (!isSleeping) {
@@ -202,8 +207,11 @@ export async function buildStatusLines(
   return lines;
 }
 
-export async function showStatus(ctx: ExtensionCommandContext): Promise<void> {
-  const contentLines = await buildStatusLines(ctx.model);
+export async function showStatus(
+  ctx: ExtensionCommandContext,
+  samplingLine?: string,
+): Promise<void> {
+  const contentLines = await buildStatusLines(ctx.model, undefined, samplingLine);
 
   await ctx.ui.custom<void>(
     (tui, theme, _keybindings, done) => {

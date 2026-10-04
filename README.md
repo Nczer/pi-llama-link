@@ -13,6 +13,7 @@ Requires Pi ≥ 0.80.6 (uses the `max` thinking tier).
 | `/llama-load` | Open model picker to load a model (router mode); Pi's current model switches to it |
 | `/llama-load <id>` | Load a specific model by ID (router mode); Pi's current model switches to it |
 | `/llama-sync` | Manually sync all server models to `models.json` |
+| `/llama-sampling` | Tune generation sampling per thinking level (writes `models.json` `modelOverrides`) |
 | `/llama-version` | Print `llama-server --version` output |
 | `/llama-link` | Toggle llama-link extension on/off |
 
@@ -62,10 +63,12 @@ On `session_start`, syncs model metadata to `~/.pi/agent/models.json`.
 - `id`, `input` (capabilities), `contextWindow`, `maxTokens` (no `name` field — Pi displays the id). `contextWindow`/`maxTokens` are omitted when neither the server nor models.json records a size.
 - Model `id` uses the model's first alias when present (e.g. `Qwen3.8-27B` instead of `Qwen3.8-27B-Q4_K_XL`). llama.cpp resolves aliases on every endpoint (`/v1/chat/completions`, `/props`, `/slots`, `/models/load|unload`), so the alias is directly usable as the request model. Real ids are always reserved; on alias collision the first model wins.
 - Persisted metadata (`llama-metadata.json`) is re-keyed from old real ids to alias ids on sync, so thinking/context overrides survive
+- Sampling config (`samplingParams`, `samplingParamsByThinkingLevel`) already on a model entry is carried into the rebuilt entry, and `modelOverrides` is spread untouched — a sync never drops tuning
 - Skips write if model list and context windows are unchanged
 - Each server writes under its own provider key
 - Filters out auto-exposed HF cache entries (undefined models like `unsloth/Qwen3.6-27B-MTP-GGUF:Q4_K_XL`)
 - Removes provider entries for servers no longer configured (e.g., remote URL unset)
+- **Parse tolerance**: `models.json` is read with JSON comments and a BOM stripped (same treatment pi gives it), so a hand-annotated file is not mistaken for an empty one. When the file still cannot be parsed, every writer (`sync`, `/llama-sampling`) leaves it alone and reports the problem instead of rewriting it
 
 ## Session Start
 
@@ -93,6 +96,63 @@ DeepSeek templates gate on `thinking` in `{% if ... %}` form (never `{{ thinking
 
 Discovered metadata (style + parsed tiers/aliases) is persisted to `llama-metadata.json` and applied on every model sync.
 
+## Sampling Tuning
+
+`/llama-sampling` tunes generation sampling per thinking level. Config is written to `~/.pi/agent/models.json` under the provider's `modelOverrides` — the layer pi merges last and llama-link's own syncs never overwrite:
+
+```json
+"providers": {
+  "llama-cpp": {
+    "modelOverrides": {
+      "Qwen3.8-27B": {
+        "samplingParams": { "temperature": 0.7 },
+        "samplingParamsByThinkingLevel": { "off": { "temperature": 0.2 }, "max": { "top_k": 20 } }
+      }
+    }
+  }
+}
+```
+
+### Layers
+
+pi merges the layers per key at request time (`resolveSamplingParams`, `packages/ai/src/api/simple-options.ts`) and `Object.assign`s the result onto the request body (`openai-completions.ts:1006`):
+
+1. **server startup values** — nothing configured → the server's own `--temperature` / `--top-k` / `--top-p` / `--min-p`. llama-link ships no defaults of its own.
+2. **flat `samplingParams`** — applies to every thinking level.
+3. **`samplingParamsByThinkingLevel[<level>]`** — wins over the flat layer for that level.
+
+pi clamps the thinking level *before* the lookup (`clampThinkingLevel`), so an entry for a level the model does not expose is dead config; `/llama-sampling` offers `All levels` plus the exposed ones only (`getSupportedThinkingLevels`). A `samplingParams` written directly on the `models[]` entry works as well and sits *underneath* `modelOverrides`: the UI reads and displays the combined view (`effectiveOverride`), and clearing removes the override layer only.
+
+### Keys
+
+| Key | Valid | Meaning |
+|-----|-------|---------|
+| `temperature` | ≥ 0 | `0` = greedy, `1` = neutral, higher = more random |
+| `top_p` | > 0, ≤ 1 | `1` = no nucleus truncation |
+| `top_k` | integer ≥ 0 | `0` = full vocabulary (llama-server) |
+| `min_p` | 0..1 | `0` = off |
+
+Any other key the server accepts (`repeat_penalty`, `typical_p`, `min_keep`, `dry_*`, `grammar`, …) reaches the server as-is — the whole map is assigned onto the request body — so those are a hand-edit away; the command curates the four above.
+
+### Command flow
+
+1. **model** — picker when several llama models are synced, otherwise the current model
+2. **target** — `All levels` plus the levels pi exposes for that model
+3. **key** — the four keys, each annotated with what is in effect (`tuned <value>` or the server's own value)
+4. **value** — the hint line explains the key; empty input clears that key for that target
+
+The write goes through `patchModelsJson` (flush the debounced sync write → read → mutate → atomic write). Only the two sampling keys inside `modelOverrides[<id>]` are touched; an override entry is removed when it becomes completely empty, and one that still holds other settings (`contextWindow`, …) is kept. The command refuses to write when `models.json` cannot be parsed.
+
+**Applying**: pi composes the `Model` object before the write, so a change to the current model is re-applied — `modelRegistry.refresh({ providers: [id] })` re-reads models.json, `pi.setModel()` re-composes the model, and the thinking level is captured and restored (pi re-derives it from settings on any switch, `agent-session.ts` `_getThinkingLevelForModelSwitch`; the switch adds a model-change entry to the transcript). A change to another model reports that it applies when you switch.
+
+**Reading it back**: `/llama-model` prints the values in effect for the active model — `Sampling [off]: temp 0.20 · top_k 40` — or, with nothing tuned, the server's own values marked `(server defaults)`, taken from the persisted `/props` metadata.
+
+### Backend notes
+
+- **llama-server**: unset keys keep the startup config; `temperature 0` is greedy (`tools/server/server-schema.cpp:118`). Per-model startup values are reported as `/props` `default_generation_settings.params` (`tools/server/server-context.cpp:4604`), fetched by the lazy discovery as `/props?model=<id>&autoload=false` and persisted in `llama-metadata.json`. A model that has never answered `/props` shows `server values unknown`.
+- **Strata**: an absent `temperature` is greedy and `temperature=0` is not forwarded (`Strata/serve/server.py:300-301`); the sampled path takes `top_k` 1..64 (`serve/server.py:2755-2757`).
+
+
 ## Architecture
 
 **Modules**
@@ -102,6 +162,7 @@ Discovered metadata (style + parsed tiers/aliases) is persisted to `llama-metada
 - `metadata.ts` — per-server:model capability metadata (thinking style, context window) persisted to `llama-metadata.json`: debounced store, key migration + stale pruning, overlay application, lazy `/props` discovery
 - `thinking-style.ts` — pure style classification + template-derived tier exposure over /props data (no pi dependency)
 - `thinking.ts` — applies the discovered style to Pi model configs (level maps, compat kwargs) and decides `thinking_budget_tokens` injection
+- `sampling.ts` — sampling tuning: key/level vocabulary, value validation, server defaults from `/props`, exposed-level and level-clamp mirroring of pi, the effective (model entry + modelOverrides) view, `setSampling` writes + pruning, status-line formatting
 - `sync.ts` — `models.json` sync: alias-based ids (`resolveApiIds`, `modelsJsonApiId` lookup), change detection, debounced write + flush, stale-provider pruning; applies the metadata overlay per model
 - `watch.ts` — per-request progress watcher (auto-load): ephemeral `/models/sse` percentage updates + `/models` heartbeat as source of truth, status-bar display; all pi access via injected `WatchGlue`
 - `status.ts` — the `/llama-model` overlay: `buildStatusLines` (accepts a pre-fetched `ServerInfo[]`) + border rendering
@@ -121,6 +182,7 @@ The `/llama-model` overlay shows per-server:
 - **Active generation** (from `/slots`): active/total slots, tokens decoded, remaining
 - **Metrics** (from `/metrics`, requires `--metrics` flag): KV cache %, gen/prefill tok/s, queue depth
 - **Available models**: all registered models with status icons
+- **Sampling** (active model only): values in effect for the current thinking level, tuned or server-default, from models.json + `llama-metadata.json` — no API call
 
 ## Gotchas
 
@@ -140,8 +202,10 @@ The `/llama-model` overlay shows per-server:
 - **Load UI**: `/llama-load` with no args shows `ctx.ui.select` picker. With an arg, loads directly.
 - **Load server**: `/llama-load` prefers the server owning the current model, but only while it answers — otherwise it falls back to the reachable ones (one → use it with a warning, several → ask). An explicit id that lives on another reachable server is loaded there instead.
 - **Switch candidates are cross-server**: the session-start offer keys on the current model being unusable (server down or model not loaded), not on which provider the loaded model belongs to.
+- **Sampling config lives in `modelOverrides`, never in `settings-ext.json`**: pi owns `settings.json` and validates `models.json` with TypeBox (`model-config.ts`), and an unknown key there invalidates the whole file — which is why `/llama-sampling` writes only the keys pi accepts, and why the extension never invents sampling defaults.
+- **Thinking level survives a live re-apply**: `pi.setModel` re-derives the level from settings (per-model default > global default > current session), so `reapplyModel` restores the session level explicitly afterwards.
 
 ## Development
 
-- Tests: `npx vitest run` — module-level tests (`thinking-style`, `thinking`, `server`, `metadata`, `sync`, `watch`, `status`, `ext-settings`), incl. local-HTTP integration for discovery, sync, and the inflight watcher (load phase) plus the index.ts switch glue (`session-switch.test.ts`: session-start offer, cross-server candidates, `/llama-load` server choice); the remaining pi glue is verified in a live session
+- Tests: `npx vitest run` — module-level tests (`thinking-style`, `thinking`, `server`, `metadata`, `sync`, `sampling`, `watch`, `status`, `ext-settings`), incl. local-HTTP integration for discovery, sync, and the inflight watcher (load phase) plus the index.ts switch glue (`session-switch.test.ts`: session-start offer, cross-server candidates, `/llama-load` server choice); the remaining pi glue is verified in a live session
 - Run `pi --extension .../index.ts` and test the hooks and commands in a live session

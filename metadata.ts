@@ -21,6 +21,7 @@ import {
   applyEffortThinkingSupport,
 } from "./thinking";
 import { atomicWrite, agentDir } from "./ext-settings";
+import { serverSamplingDefaults, type SamplingMap } from "./sampling";
 
 const METADATA_JSON = join(agentDir(), "llama-metadata.json");
 
@@ -34,6 +35,13 @@ export interface ModelMetadataEntry {
   /** Off-token in the template's effort vocabulary (none/off/no_think). */
   effortOffToken?: string;
   contextWindow?: number;
+  /**
+   * Sampling the server applies when a request does not override it
+   * (/props default_generation_settings.params). Display baseline only:
+   * applyMetadataOverlay never writes it into a model config — tuning belongs
+   * to the user's modelOverrides, and unset means "ask the server".
+   */
+  sampling?: SamplingMap;
 }
 
 export interface ModelMetadata {
@@ -236,6 +244,12 @@ export async function discoverModelMetadata(
       metadata.contextWindow = data.default_generation_settings.n_ctx;
       updated = true;
     }
+
+    // Server-side sampling defaults: persisted so the sampling UI can name the
+    // baseline without another API call. Not a model-config override, so it does
+    // not by itself justify re-syncing models.json
+    const serverSampling = serverSamplingDefaults(data);
+    if (serverSampling) metadata.sampling = serverSampling;
 
     if (Object.keys(metadata).length > 0) {
       persistModelMetadata(serverId, modelId, metadata);
