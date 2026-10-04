@@ -145,7 +145,7 @@ Any other key the server accepts (`repeat_penalty`, `typical_p`, `min_keep`, `dr
 2. **target** — `all levels (global)` plus the levels pi exposes for that model, each showing what it contributes: `high — own: temp 0.20`, `low — same as global`, `all levels (global) — set: temp 0.70 · top_p 0.90`
 3. **key** — the four keys, annotated with where the value comes from: `temperature = 0.20 (this level)`, `top_p = 0.90 (same as global)`, `top_k = 40 (server)`, `min_p — unset`. Inside the `all levels (global)` list the same value reads `(global)`
 4. **value** — the hint line explains the key; empty input clears that key for that target, and the prompt names what it then falls back to (`… empty removes it → server 40`)
-5. **back to the key list** — after a write the same list is shown again with fresh annotations, so temperature, top_p, top_k can be tuned in a row. `‹ all levels / another thinking level` goes up to the target list, `done` (or Escape) ends the command
+5. **back to the key list** — after a write the same list is shown again with fresh annotations, so temperature, top_p, top_k can be tuned in a row. Escape walks back the way pi's own selectors do — value → keys → targets → out of the command — and pi already prints `↑↓ navigate · Enter select · Esc cancel` under every list, so the command adds no nav items of its own
 
 A value that is already set in the layer being edited, or a clear where the layer owns nothing, reports where the number actually comes from instead of writing. Only exposed levels are offered: pi clamps the requested level before the lookup, so an entry for a hidden level never applies.
 

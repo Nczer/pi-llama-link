@@ -658,14 +658,13 @@ async function samplingCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext): 
 
   // Level -> key -> value, and a write lands back on the key list with fresh
   // annotations, so temperature, top_p, top_k can be tuned one after another.
-  // "done" (or Escape) leaves the command; "‹ …" goes up to the level list.
-  const NAV_UP = "\u2039 all levels / another thinking level";
-  const NAV_DONE = "done";
+  // Escape walks back the way pi's own selectors do (keys -> targets -> out);
+  // pi already prints "↑↓ navigate  Enter select  Esc cancel" under the list.
   let at: SamplingTarget = "all";
   let needLevel = true;
   let dirty = false;
 
-  for (let finished = false; !finished; ) {
+  for (;;) {
     if (needLevel) {
       const picked = await pickLevel();
       if (picked === undefined) break;
@@ -681,12 +680,15 @@ async function samplingCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext): 
       );
       const pick = await ctx.ui.select(
         `${modelId} · ${at === "all" ? "all levels (global)" : `${at} thinking`}`,
-        [...keyItems, NAV_UP, NAV_DONE],
+        keyItems,
       );
-      if (pick === undefined || pick === NAV_DONE) { finished = true; break; }
-      const keyIndex = keyItems.indexOf(pick);
-      if (keyIndex < 0) { needLevel = true; backToLevels = true; break; }
-
+      // Esc (or a list that no longer matches) goes up to the target list
+      const keyIndex = keyItems.indexOf(pick ?? "");
+      if (keyIndex < 0) {
+        needLevel = true;
+        backToLevels = true;
+        break;
+      }
       const key = SAMPLING_KEYS[keyIndex];
       const where = `${modelId} · ${at === "all" ? "all levels" : at}`;
       const prov = keyProvenance(override, defaults, at, key);
@@ -701,7 +703,7 @@ async function samplingCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext): 
         `${key}: new ${at === "all" ? "global" : `${at} `}value (empty removes it \u2192 ${beneathText})`,
         SAMPLING_HINTS[key],
       );
-      if (raw === undefined) { finished = true; break; }
+      if (raw === undefined) break; // Esc: back to the key list
 
       let value: number | undefined;
       if (raw.trim()) {
