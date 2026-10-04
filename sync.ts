@@ -8,7 +8,6 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import {
   gatherServers,
   resolveServers,
@@ -26,9 +25,9 @@ import {
   migrateMetadataKeys,
   applyMetadataOverlay,
 } from "./metadata";
-import { atomicWrite } from "./ext-settings";
+import { atomicWrite, agentDir } from "./ext-settings";
 
-const MODELS_JSON = join(process.env.HOME || ".", ".pi", "agent", "models.json");
+const MODELS_JSON = join(agentDir(), "models.json");
 
 interface ModelsJson {
   providers: Record<string, any>;
@@ -79,7 +78,7 @@ export function resolveApiIds(models: ModelsDataProperty[]): Map<string, string>
 
 export function modelsChanged(
   existing: any[],
-  incoming: Array<{ id: string; contextWindow: number; input: string[]; reasoning?: boolean }>,
+  incoming: Array<{ id: string; contextWindow?: number; input: string[]; reasoning?: boolean }>,
 ): boolean {
   if (existing.length !== incoming.length) return true;
   const existingMap = new Map(existing.map((m: any) => [m.id, m]));
@@ -100,6 +99,7 @@ export function modelsChanged(
 let modelsWriteTimer: NodeJS.Timeout | null = null;
 let pendingModelsStr: string | null = null;
 let pendingModelsNotify: ((value: string | undefined) => void) | null = null;
+let pendingUnknownContext = 0;
 let syncNotifyTimer: NodeJS.Timeout | null = null;
 const SYNC_NOTIFY_DURATION = 3000;
 
@@ -111,14 +111,27 @@ export function flushModelsWrite(): void {
   pendingModelsStr = null;
   const notify = pendingModelsNotify;
   pendingModelsNotify = null;
+  const unknown = pendingUnknownContext;
+  pendingUnknownContext = 0;
   if (notify) {
     if (syncNotifyTimer) clearTimeout(syncNotifyTimer);
-    notify("✓ models synced -- /reload to use");
+    notify(
+      `✓ models synced${unknown ? ` · context size unknown for ${unknown}` : ""} -- /reload to use`,
+    );
     syncNotifyTimer = setTimeout(() => {
       notify(undefined);
       syncNotifyTimer = null;
     }, SYNC_NOTIFY_DURATION);
   }
+}
+
+interface SyncedModel {
+  id: string;
+  input: string[];
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning: boolean;
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 }
 
 export async function syncToModelsJson(
@@ -144,18 +157,29 @@ export async function syncToModelsJson(
     const apiIds = resolveApiIds(filteredModels);
     validModels.set(server.id, new Set(apiIds.values()));
 
-    const modelConfigs: Array<Omit<ProviderModelConfig, "name">> = filteredModels.map(m => {
-      const contextWindow = resolveContextSize(m);
-      return {
-        id: apiIds.get(m.id)!,
+    const modelConfigs: SyncedModel[] = filteredModels.map(m => {
+      const id = apiIds.get(m.id)!;
+      // An unreported context size stays unknown: keep what models.json already
+      // records (from an earlier read that did report one) rather than invent a
+      // number, and omit the field when nothing is known — pi then applies its
+      // own default, and the sync notification says the size was unknown
+      // instead of the file silently claiming 32768.
+      const reported = resolveContextSize(m);
+      const contextWindow =
+        reported ?? (config.providers[server.id]?.models || []).find((e: any) => e.id === id)?.contextWindow;
+      const entry: SyncedModel = {
+        id,
         input: (m.architecture?.input_modalities || ["text"]).filter(
           (mod) => mod === "text" || mod === "image",
         ),
-        contextWindow,
-        maxTokens: contextWindow,
         reasoning: false,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       };
+      if (contextWindow !== undefined) {
+        entry.contextWindow = contextWindow;
+        entry.maxTokens = contextWindow;
+      }
+      return entry;
     });
 
     // Re-key persisted metadata from real ids to alias ids so overrides survive
@@ -176,6 +200,7 @@ export async function syncToModelsJson(
       apiKey: resolveApiKey(server.id),
       models: modelsWithOverlay.map(m => ({ ...m, reasoning: m.reasoning ?? false })),
     };
+    pendingUnknownContext += modelsWithOverlay.filter((m: any) => m.contextWindow === undefined).length;
     wrote = true;
   }
 

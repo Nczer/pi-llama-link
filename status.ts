@@ -148,7 +148,7 @@ export async function buildStatusLines(
       const isSleeping = status === "sleeping";
 
       lines.push(`  ${icon} ${name} (${status})${isActive ? " ✓ active" : ""}`);
-      lines.push(`     Context: ${contextSize.toLocaleString()} tokens · Input: ${caps.join(", ")}`);
+      lines.push(`     Context: ${contextSize === null ? "unknown" : contextSize.toLocaleString()} tokens · Input: ${caps.join(", ")}`);
 
       // Skip live endpoints for sleeping models — they wake the model on the router
       if (!isSleeping) {

@@ -162,3 +162,44 @@ describe("syncToModelsJson (integration, local HTTP server)", () => {
     expect(wrote).toBe(false);
   });
 });
+
+describe("syncToModelsJson with an unreported context size", () => {
+  let server: http.Server;
+  const notified: Array<string | undefined> = [];
+  // Same model as above, but the server reports no meta.n_ctx and no --ctx-size.
+  const models = [{ id: "real-1", aliases: ["short-1"], architecture: { input_modalities: ["text"] } }];
+
+  beforeAll(async () => {
+    server = http.createServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ models, data: models }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    process.env.LLAMA_SERVER_URL = `http://127.0.0.1:${(server.address() as any).port}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it("omits the field instead of inventing one, and discloses it", async () => {
+    rmSync(modelsFile, { force: true });
+    expect(await sync.syncToModelsJson(undefined, (v) => notified.push(v))).toBe(true);
+    sync.flushModelsWrite();
+    const entry = JSON.parse(readFileSync(modelsFile, "utf-8")).providers["llama-cpp"].models[0];
+    // No 32768: pi applies its own default, and the user is told the size is unknown.
+    expect(entry.contextWindow).toBeUndefined();
+    expect(entry.maxTokens).toBeUndefined();
+    expect(notified[0]).toContain("context size unknown for 1");
+  });
+
+  it("keeps the size models.json already records rather than losing it", async () => {
+    writeFileSync(
+      modelsFile,
+      JSON.stringify({ providers: { "llama-cpp": { models: [{ id: "short-1", input: ["text"], contextWindow: 8192, maxTokens: 8192, reasoning: false }] } } }),
+    );
+    expect(await sync.syncToModelsJson(undefined, (v) => notified.push(v))).toBe(false); // unchanged → no rewrite
+    const entry = JSON.parse(readFileSync(modelsFile, "utf-8")).providers["llama-cpp"].models[0];
+    expect(entry.contextWindow).toBe(8192);
+  });
+});

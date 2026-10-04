@@ -12,7 +12,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { loadExtSettings } from "./ext-settings";
+import { loadExtSettings, agentDir } from "./ext-settings";
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -121,15 +121,18 @@ export interface SlotInfo {
   next_token?: SlotNextToken | SlotNextToken[];
 }
 
-/** Aggregate decoded/remaining tokens of a slot across next_token entries. */
+/** Aggregate decoded/remaining tokens of a slot across next_token entries.
+ *  Both are summed: a slot generating several completions has several
+ *  remaining budgets, and "remaining" means the same total the decoded count
+ *  does. 0 when nothing is reported. */
 export function slotTokenProgress(slot: SlotInfo): { decoded: number; remain: number } {
   const t = slot.next_token;
   const items = t ? (Array.isArray(t) ? t : [t]) : [];
   let decoded = 0;
-  let remain = -1;
+  let remain = 0;
   for (const item of items) {
     decoded += item.n_decoded || 0;
-    if (item.n_remain > 0) remain = item.n_remain;
+    if (item.n_remain > 0) remain += item.n_remain;
   }
   return { decoded, remain };
 }
@@ -232,7 +235,7 @@ export function resolveServers(): ServerConfig[] {
 }
 
 function resolveApiKeyFromDisk(serverId: string): string {
-  const authPath = join(process.env.HOME || ".", ".pi", "agent", "auth.json");
+  const authPath = join(agentDir(), "auth.json");
   if (!existsSync(authPath)) return API_KEY_PLACEHOLDER;
   try {
     const cfg = JSON.parse(readFileSync(authPath, "utf-8"));
@@ -643,9 +646,9 @@ export class ModelInspector {
     return this.cachedProps;
   }
 
-  contextSize(modelId: string): number {
+  contextSize(modelId: string): number | null {
     const model = this.cachedData?.find((m) => m.id === modelId);
-    return model ? resolveContextSize(model) : 32768;
+    return model ? resolveContextSize(model) : null;
   }
 
   capabilities(modelId: string): string[] {
@@ -693,14 +696,16 @@ export class ModelInspector {
     return this.cachedSlots.get(key)!;
   }
 
+  /** Aggregate progress over the slots that are generating: decoded tokens
+   *  and tokens still to generate, summed across them (see slotTokenProgress). */
   getSlotInfo(modelId?: string): { decoded: number; remain: number; totalSlots: number; activeSlots: number } {
     const slots = this.cachedSlots.get(modelId ?? "") || [];
     const active = slots.filter((s) => s.is_processing);
-    let decoded = 0, remain = -1;
+    let decoded = 0, remain = 0;
     for (const s of active) {
       const p = slotTokenProgress(s);
       decoded += p.decoded;
-      if (p.remain > 0) remain = p.remain;
+      if (p.remain > 0) remain += p.remain;
     }
     return { decoded, remain, totalSlots: slots.length, activeSlots: active.length };
   }
@@ -743,7 +748,13 @@ export function isAutoExposedCacheEntry(m: ModelsDataProperty): boolean {
   return false;
 }
 
-export function resolveContextSize(m: ModelsDataProperty): number {
+/**
+ * The server's own answer for a model's context size, or null when the server
+ * did not report one. Callers must not replace null with a guess: this value
+ * ends up in models.json as the model's contextWindow, which drives pi's
+ * context stats and auto-compaction thresholds.
+ */
+export function resolveContextSize(m: ModelsDataProperty): number | null {
   // Router mode: parse from status.args (--ctx-size, -c, -ctx, or --fit-ctx)
   if (m.status?.args) {
     const args = m.status.args;
@@ -758,8 +769,7 @@ export function resolveContextSize(m: ModelsDataProperty): number {
   // Single mode: use meta.n_ctx, then n_ctx_train
   if (m.meta?.n_ctx) return m.meta.n_ctx;
   if (m.meta?.n_ctx_train) return m.meta.n_ctx_train;
-  // Fallback default
-  return 32768;
+  return null; // nothing reported — unknown, not a made-up default
 }
 
 export function matchModel(m: { id: string; aliases?: string[] }, piModelId: string): boolean {

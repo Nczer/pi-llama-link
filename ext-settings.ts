@@ -23,7 +23,19 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-export const SETTINGS_PATH = path.join(os.homedir(), ".pi", "agent", "settings-ext.json");
+/**
+ * pi's agent directory: PI_CODING_AGENT_DIR when set (with a leading ~
+ * expanded, like pi's getAgentDir), else ~/.pi/agent. Reading settings, the
+ * metadata overlay, auth.json or models.json under a hardcoded HOME silently
+ * misses them all when the agent dir is relocated.
+ */
+export function agentDir(): string {
+  const env = process.env.PI_CODING_AGENT_DIR;
+  if (env) return env.startsWith("~") ? path.join(os.homedir(), env.slice(1)) : env;
+  return path.join(os.homedir(), ".pi", "agent");
+}
+
+export const SETTINGS_PATH = path.join(agentDir(), "settings-ext.json");
 
 /** Write via temp file + rename so a crash can't leave a half-written JSON. */
 export function atomicWrite(p: string, content: string): void {

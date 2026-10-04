@@ -142,13 +142,51 @@ describe("resolveContextSize", () => {
     );
     expect(server.resolveContextSize(m({ status: { value: "loaded", args: ["-c", "8192"] } }))).toBe(8192);
   });
-  it("flag without a value falls through", () => {
-    expect(server.resolveContextSize(m({ status: { value: "loaded", args: ["--fit-ctx"] } }))).toBe(32768);
+  it("flag without a value is unknown, not a guess", () => {
+    expect(server.resolveContextSize(m({ status: { value: "loaded", args: ["--fit-ctx"] } }))).toBeNull();
   });
-  it("single-mode meta.n_ctx, then n_ctx_train, fallback 32768", () => {
+  it("single-mode meta.n_ctx, then n_ctx_train, otherwise null", () => {
     expect(server.resolveContextSize(m({ meta: { n_ctx: 4096, n_ctx_train: 128000 } }))).toBe(4096);
     expect(server.resolveContextSize(m({ meta: { n_ctx: 0, n_ctx_train: 128000 } }))).toBe(128000);
-    expect(server.resolveContextSize(m({}))).toBe(32768);
+    // The old 32768 fallback ended up in models.json as the model's
+    // contextWindow, so pi sized the session around an invented number.
+    expect(server.resolveContextSize(m({}))).toBeNull();
+  });
+});
+
+describe("slot progress", () => {
+  it("sums decoded and remaining across next_token entries", () => {
+    expect(
+      server.slotTokenProgress({
+        is_processing: true,
+        n_ctx: 8192,
+        next_token: [{ n_decoded: 10, n_remain: 100 }, { n_decoded: 5, n_remain: 50 }],
+      }),
+    ).toEqual({ decoded: 15, remain: 150 });
+  });
+
+  it("handles the legacy single-object form and an idle slot", () => {
+    expect(server.slotTokenProgress({ is_processing: true, n_ctx: 8192, next_token: { n_decoded: 7, n_remain: 3 } })).toEqual({ decoded: 7, remain: 3 });
+    expect(server.slotTokenProgress({ is_processing: false, n_ctx: 8192 })).toEqual({ decoded: 0, remain: 0 });
+  });
+
+  it("aggregates remaining across every active slot, not just the last one", async () => {
+    const inspector = new server.ModelInspector({ id: "llama-cpp", name: "Local", url: "http://127.0.0.1:8080" });
+    (inspector as any).cachedSlots.set("", [
+      { is_processing: true, n_ctx: 8192, next_token: [{ n_decoded: 100, n_remain: 900 }] },
+      { is_processing: true, n_ctx: 8192, next_token: [{ n_decoded: 200, n_remain: 800 }] },
+      { is_processing: false, n_ctx: 8192 },
+    ]);
+    expect(inspector.getSlotInfo()).toEqual({ decoded: 300, remain: 1700, totalSlots: 3, activeSlots: 2 });
+  });
+
+  it("contextSize reports null for a model the server did not report", () => {
+    const inspector = new server.ModelInspector(
+      { id: "llama-cpp", name: "Local", url: "http://127.0.0.1:8080" },
+      { data: [{ id: "m1", meta: { n_ctx: 4096 } }], mode: "single" },
+    );
+    expect(inspector.contextSize("m1")).toBe(4096);
+    expect(inspector.contextSize("absent")).toBeNull();
   });
 });
 

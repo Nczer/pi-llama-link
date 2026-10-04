@@ -20,9 +20,9 @@ import {
   applyEnableThinkingSupport,
   applyEffortThinkingSupport,
 } from "./thinking";
-import { atomicWrite } from "./ext-settings";
+import { atomicWrite, agentDir } from "./ext-settings";
 
-const METADATA_JSON = join(process.env.HOME || ".", ".pi", "agent", "llama-metadata.json");
+const METADATA_JSON = join(agentDir(), "llama-metadata.json");
 
 // ── Types ───────────────────────────────────────────────────────────────
 

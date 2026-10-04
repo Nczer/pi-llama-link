@@ -59,7 +59,7 @@ The `/llama-load` command has its own progress display (SSE with polling fallbac
 
 On `session_start`, syncs model metadata to `~/.pi/agent/models.json`.
 
-- `id`, `input` (capabilities), `contextWindow`, `maxTokens` (no `name` field — Pi displays the id)
+- `id`, `input` (capabilities), `contextWindow`, `maxTokens` (no `name` field — Pi displays the id). `contextWindow`/`maxTokens` are omitted when neither the server nor models.json records a size.
 - Model `id` uses the model's first alias when present (e.g. `Qwen3.8-27B` instead of `Qwen3.8-27B-Q4_K_XL`). llama.cpp resolves aliases on every endpoint (`/v1/chat/completions`, `/props`, `/slots`, `/models/load|unload`), so the alias is directly usable as the request model. Real ids are always reserved; on alias collision the first model wins.
 - Persisted metadata (`llama-metadata.json`) is re-keyed from old real ids to alias ids on sync, so thinking/context overrides survive
 - Skips write if model list and context windows are unchanged
@@ -130,7 +130,7 @@ The `/llama-model` overlay shows per-server:
 - **Router mode**: `/props` returns router-level info only. Status and context size come from `/models` `status.args`. Slots/metrics need `?model=X` query param.
 - **Metrics requires `--metrics`**: `/metrics` returns 501 if server started without `--metrics` flag. Gracefully degrades (shows nothing).
 - **Slots may be disabled**: `/slots` can be disabled with `--no-slots`. Gracefully degrades.
-- **Context size fallback**: models with no `--ctx-size` in args get 32768 default.
+- **Context size is never invented**: it comes from `/models` `status.args` (`--ctx-size`, `-c`, `-ctx`, `--fit-ctx`) or `meta.n_ctx`/`n_ctx_train`. When the server reports none, the last size models.json already recorded is kept; if there is none, the field is left out (Pi applies its own default) and the sync notification reports how many models have an unknown size. `/llama-model` shows `Context: unknown`.
 - **Remote is opt-in**: no default remote URL. Must be set explicitly in `settings-ext.json` (`llama-link` namespace).
 - **Provider IDs**: both `llama-server` and `llama-cpp` are accepted for unload checks.
 - **Multi-server**: `rpc` takes a `ServerConfig`, not a global URL. All helpers are per-server.
