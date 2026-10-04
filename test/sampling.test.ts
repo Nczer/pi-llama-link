@@ -18,6 +18,9 @@ import {
   sameSampling,
   carrySamplingFields,
   describeOverride,
+  keyProvenance,
+  formatKeyItem,
+  formatTargetItem,
   formatSampling,
   samplingStatusLine,
   num,
@@ -241,6 +244,46 @@ describe("effectiveOverride", () => {
   });
 });
 
+describe("provenance labels", () => {
+  const override = {
+    samplingParams: { temperature: 0.7, top_p: 0.9 },
+    samplingParamsByThinkingLevel: { high: { temperature: 0.2 } },
+  };
+  const server = { temperature: 0.8, top_k: 40, top_p: 0.95, min_p: 0.05 };
+
+  it("keyProvenance names the layer a value comes from", () => {
+    expect(keyProvenance(override, server, "high", "temperature")).toEqual({ source: "level", value: 0.2 });
+    expect(keyProvenance(override, server, "high", "top_p")).toEqual({ source: "global", value: 0.9 });
+    expect(keyProvenance(override, server, "high", "top_k")).toEqual({ source: "server", value: 40 });
+    expect(keyProvenance(override, server, "high", "min_p")).toEqual({ source: "server", value: 0.05 });
+    expect(keyProvenance(override, undefined, "low", "top_p")).toEqual({ source: "global", value: 0.9 });
+    expect(keyProvenance(override, undefined, "low", "top_k")).toEqual({ source: "unset" });
+    // the global layer never reports a level's own value
+    expect(keyProvenance(override, server, "all", "temperature")).toEqual({ source: "global", value: 0.7 });
+  });
+
+  it("a level that inherits says so instead of repeating the number as its own", () => {
+    expect(formatKeyItem("high", "temperature", keyProvenance(override, server, "high", "temperature")))
+      .toBe("temperature = 0.20 (this level)");
+    expect(formatKeyItem("high", "top_p", keyProvenance(override, server, "high", "top_p")))
+      .toBe("top_p = 0.90 (same as global)");
+    expect(formatKeyItem("high", "top_k", keyProvenance(override, server, "high", "top_k")))
+      .toBe("top_k = 40 (server)");
+    expect(formatKeyItem("low", "min_p", keyProvenance(override, undefined, "low", "min_p")))
+      .toBe("min_p — unset");
+    // inside the global list the same value is labelled global, not "same as global"
+    expect(formatKeyItem("all", "temperature", keyProvenance(override, server, "all", "temperature")))
+      .toBe("temperature = 0.70 (global)");
+  });
+
+  it("target items show what each target contributes, not the merged result", () => {
+    expect(formatTargetItem("all", override)).toBe("all levels (global) — set: temp 0.70 · top_p 0.90");
+    expect(formatTargetItem("high", override)).toBe("high — own: temp 0.20");
+    expect(formatTargetItem("low", override)).toBe("low — same as global");
+    expect(formatTargetItem("all", undefined)).toBe("all levels (global) — nothing set");
+  });
+});
+
 describe("readOverride / sameSampling / carrySamplingFields", () => {
   it("readOverride returns both containers (missing → undefined fields)", () => {
     const config = { providers: { "llama-cpp": { modelOverrides: { m1: { samplingParams: { top_k: 20 } } } } } };
@@ -284,7 +327,7 @@ describe("formatting", () => {
     expect(describeOverride({ samplingParamsByThinkingLevel: { high: { temperature: 1 }, off: { temperature: 0.2 } } }))
       .toBe("off: temp 0.20 · high: temp 1");
     expect(describeOverride({ samplingParams: { top_p: 0.9 }, samplingParamsByThinkingLevel: { high: { top_k: 20 } } }))
-      .toBe("all: top_p 0.90 · high: top_k 20");
+      .toBe("global: top_p 0.90 · high: top_k 20");
   });
   it("samplingStatusLine names the source of the values", () => {
     const server = { temperature: 0.8, top_k: 40 };

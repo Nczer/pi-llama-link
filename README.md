@@ -126,7 +126,7 @@ pi merges the layers per key at request time (`resolveSamplingParams`, `packages
 2. **flat `samplingParams`** — applies to every thinking level.
 3. **`samplingParamsByThinkingLevel[<level>]`** — wins over the flat layer for that level.
 
-pi clamps the thinking level *before* the lookup (`clampThinkingLevel`), so an entry for a level the model does not expose is dead config; `/llama-sampling` offers `All levels` plus the exposed ones only (`getSupportedThinkingLevels`). A `samplingParams` written directly on the `models[]` entry works as well and sits *underneath* `modelOverrides`: the UI reads and displays the combined view (`effectiveOverride`), and clearing removes the override layer only.
+pi clamps the thinking level *before* the lookup (`clampThinkingLevel`), so an entry for a level the model does not expose is dead config; `/llama-sampling` offers `all levels (global)` plus the exposed ones only (`getSupportedThinkingLevels`). A `samplingParams` written directly on the `models[]` entry works as well and sits *underneath* `modelOverrides`: the UI reads and displays the combined view (`effectiveOverride`), and clearing removes the override layer only.
 
 ### Keys
 
@@ -142,13 +142,16 @@ Any other key the server accepts (`repeat_penalty`, `typical_p`, `min_keep`, `dr
 ### Command flow
 
 1. **model** — picker when several llama models are synced, otherwise the current model
-2. **target** — `All levels` plus the levels pi exposes for that model
-3. **key** — the four keys, each annotated with what is in effect (`tuned <value>` or the server's own value)
-4. **value** — the hint line explains the key; empty input clears that key for that target
+2. **target** — `all levels (global)` plus the levels pi exposes for that model, each showing what it contributes: `high — own: temp 0.20`, `low — same as global`, `all levels (global) — set: temp 0.70 · top_p 0.90`
+3. **key** — the four keys, annotated with where the value comes from: `temperature = 0.20 (this level)`, `top_p = 0.90 (same as global)`, `top_k = 40 (server)`, `min_p — unset`. Inside the `all levels (global)` list the same value reads `(global)`
+4. **value** — the hint line explains the key; empty input clears that key for that target, and the prompt names what it then falls back to (`… empty removes it → server 40`)
+5. **back to the key list** — after a write the same list is shown again with fresh annotations, so temperature, top_p, top_k can be tuned in a row. `‹ all levels / another thinking level` goes up to the target list, `done` (or Escape) ends the command
+
+A value that is already set in the layer being edited, or a clear where the layer owns nothing, reports where the number actually comes from instead of writing. Only exposed levels are offered: pi clamps the requested level before the lookup, so an entry for a hidden level never applies.
 
 The write goes through `patchModelsJson` (flush the debounced sync write → read → mutate → atomic write). Only the two sampling keys inside `modelOverrides[<id>]` are touched; an override entry is removed when it becomes completely empty, and one that still holds other settings (`contextWindow`, …) is kept. The command refuses to write when `models.json` cannot be parsed.
 
-**Applying**: pi composes the `Model` object before the write, so a change to the current model is re-applied — `modelRegistry.refresh({ providers: [id] })` re-reads models.json, `pi.setModel()` re-composes the model, and the thinking level is captured and restored (pi re-derives it from settings on any switch, `agent-session.ts` `_getThinkingLevelForModelSwitch`; the switch adds a model-change entry to the transcript). A change to another model reports that it applies when you switch.
+**Applying**: pi composes the `Model` object before the write, so a change to the current model is re-applied once per command run — `modelRegistry.refresh({ providers: [id] })` re-reads models.json, `pi.setModel()` re-composes the model, and the thinking level is captured and restored (pi re-derives it from settings on any switch, `agent-session.ts` `_getThinkingLevelForModelSwitch`; the switch adds one model-change entry to the transcript, however many keys were tuned). A change to another model reports that it applies when you switch.
 
 **Reading it back**: `/llama-model` prints the values in effect for the active model — `Sampling [off]: temp 0.20 · top_k 40` — or, with nothing tuned, the server's own values marked `(server defaults)`, taken from the persisted `/props` metadata.
 

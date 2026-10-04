@@ -29,8 +29,10 @@ import {
   SAMPLING_KEYS,
   exposedLevels,
   effectiveLevel,
-  effectiveSampling,
   effectiveOverride,
+  keyProvenance,
+  formatKeyItem,
+  formatTargetItem,
   setSampling,
   parseSamplingValue,
   describeOverride,
@@ -627,7 +629,6 @@ async function samplingCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext): 
     return;
   }
 
-  const override = effectiveOverride(config, providerId, modelId);
   const defaults = loadMetadataOverlay()[providerId]?.[modelId]?.sampling;
   const { level, source, clampedFrom } = effectiveLevel(
     model as Record<string, any>, providerId, modelId,
@@ -636,78 +637,125 @@ async function samplingCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext): 
   const levelNote = clampedFrom
     ? `${level} (settings say "${clampedFrom}", the model does not expose it)`
     : `${level} (${source})`;
+  const serverText = defaults ? formatSampling(defaults) : "unknown (no /props read for this model yet)";
 
-  // Which level to tune. Only exposed levels are offered: pi clamps the
-  // requested level before looking it up, so an entry for a hidden level never
-  // applies and would look like a tuning that does nothing.
+  // Only exposed levels are offered: pi clamps the requested level before the
+  // lookup, so an entry for a hidden level never applies and would look like a
+  // tuning that does nothing. "all levels" is the global layer — a level entry
+  // overrides it per key.
   const targets: SamplingTarget[] = ["all", ...exposedLevels(model as Record<string, any>)];
-  const targetItems = targets.map((t) =>
-    t === "all"
-      ? `all levels — ${formatSampling(effectiveSampling(override, defaults, level)) || "server defaults"}`
-      : `${t} — ${formatSampling(effectiveSampling(override, defaults, t)) || "server defaults"}`,
-  );
-  const chosenTarget = await ctx.ui.select(
-    [
-      `Sampling · ${modelId}`,
-      `runs at ${levelNote} · tuned: ${describeOverride(override)} · server: ${defaults ? formatSampling(defaults) : "unknown (no /props read yet)"}`,
-    ].join("\n"),
-    targetItems,
-  );
-  const targetIndex = targetItems.indexOf(chosenTarget ?? "");
-  if (targetIndex < 0) return;
-  const target = targets[targetIndex];
-
-  // Show the tuned value and, underneath it, what the server would have used
-  const readLevel: SamplingTarget = target === "all" ? level : target;
-  const tunedOf = (key: SamplingKey): number | undefined =>
-    target === "all"
-      ? override?.samplingParams?.[key]
-      : override?.samplingParamsByThinkingLevel?.[target]?.[key];
-  const keyItems = SAMPLING_KEYS.map((key) => {
-    const tuned = tunedOf(key);
-    if (tuned !== undefined) return `${key} = ${num(tuned)}`;
-    const inherited = effectiveSampling(override, defaults, readLevel)[key];
-    if (inherited !== undefined) return `${key} = ${num(inherited)} (${target === "all" ? "server" : "from all levels/server"})`;
-    return `${key} — unset`;
-  });
-  const chosenKey = await ctx.ui.select(
-    `${modelId} · ${target === "all" ? "all levels" : `${target} thinking`}`,
-    keyItems,
-  );
-  const keyIndex = keyItems.indexOf(chosenKey ?? "");
-  if (keyIndex < 0) return;
-  const key = SAMPLING_KEYS[keyIndex];
-
-  const raw = await ctx.ui.input(`${key}: new value (empty clears this level's override)`, SAMPLING_HINTS[key]);
-  if (raw === undefined) return;
-  let value: number | undefined;
-  if (raw.trim()) {
-    const parsed = parseSamplingValue(key, raw);
-    if (parsed.error || parsed.value === undefined) {
-      ctx.ui.notify(parsed.error ?? "invalid value", "error");
-      return;
-    }
-    value = parsed.value;
-  }
-
-  const label = `${modelId} · ${target === "all" ? "all levels" : target} · ${key}`;
-  const changed = patchModelsJson((cfg) => setSampling(cfg, providerId, modelId, target, key, value));
-  if (!changed) {
-    ctx.ui.notify(
-      modelsJsonUnreadable()
-        ? "models.json could not be parsed — nothing written"
-        : `${label}: no change`,
-      modelsJsonUnreadable() ? "error" : "info",
+  const pickLevel = async (): Promise<SamplingTarget | undefined> => {
+    const items = targets.map((t) =>
+      formatTargetItem(t, effectiveOverride(readModelsJson(), providerId, modelId)),
     );
-    return;
+    const chosen = await ctx.ui.select(
+      [`Sampling · ${modelId}`, `runs at ${levelNote} · server: ${serverText}`].join("\n"),
+      items,
+    );
+    const i = items.indexOf(chosen ?? "");
+    return i < 0 ? undefined : targets[i];
+  };
+
+  // Level -> key -> value, and a write lands back on the key list with fresh
+  // annotations, so temperature, top_p, top_k can be tuned one after another.
+  // "done" (or Escape) leaves the command; "‹ …" goes up to the level list.
+  const NAV_UP = "\u2039 all levels / another thinking level";
+  const NAV_DONE = "done";
+  let at: SamplingTarget = "all";
+  let needLevel = true;
+  let dirty = false;
+
+  for (let finished = false; !finished; ) {
+    if (needLevel) {
+      const picked = await pickLevel();
+      if (picked === undefined) break;
+      at = picked;
+      needLevel = false;
+    }
+
+    let backToLevels = false;
+    while (!backToLevels) {
+      const override = effectiveOverride(readModelsJson(), providerId, modelId);
+      const keyItems = SAMPLING_KEYS.map((key) =>
+        formatKeyItem(at, key, keyProvenance(override, defaults, at, key)),
+      );
+      const pick = await ctx.ui.select(
+        `${modelId} · ${at === "all" ? "all levels (global)" : `${at} thinking`}`,
+        [...keyItems, NAV_UP, NAV_DONE],
+      );
+      if (pick === undefined || pick === NAV_DONE) { finished = true; break; }
+      const keyIndex = keyItems.indexOf(pick);
+      if (keyIndex < 0) { needLevel = true; backToLevels = true; break; }
+
+      const key = SAMPLING_KEYS[keyIndex];
+      const where = `${modelId} · ${at === "all" ? "all levels" : at}`;
+      const prov = keyProvenance(override, defaults, at, key);
+      // What this key falls back to when the layer being edited has nothing
+      const beneath = keyProvenance(override, defaults, "all", key);
+      const beneathText = beneath.source === "global" ? `all levels ${num(beneath.value!)}`
+        : beneath.source === "server" ? `server ${num(beneath.value!)}`
+        : "the server";
+      const ownSource = at === "all" ? "global" : "level";
+
+      const raw = await ctx.ui.input(
+        `${key}: new ${at === "all" ? "global" : `${at} `}value (empty removes it \u2192 ${beneathText})`,
+        SAMPLING_HINTS[key],
+      );
+      if (raw === undefined) { finished = true; break; }
+
+      let value: number | undefined;
+      if (raw.trim()) {
+        const parsed = parseSamplingValue(key, raw);
+        if (parsed.error || parsed.value === undefined) {
+          ctx.ui.notify(parsed.error ?? "invalid value", "error");
+          continue;
+        }
+        value = parsed.value;
+      } else if (prov.source !== ownSource) {
+        // Nothing of this layer's own to remove — say where the value comes from
+        ctx.ui.notify(
+          `${where} · ${key}: nothing set here — ${
+            prov.source === "global" ? `it comes from all levels (${num(prov.value!)})`
+            : prov.source === "server" ? `it is the server's own value (${num(prov.value!)})`
+            : "the server decides this one"
+          }`,
+          "info",
+        );
+        continue;
+      }
+
+      if (value !== undefined && prov.source === ownSource && prov.value === value) {
+        ctx.ui.notify(`${where} · ${key}: already ${num(value)}`, "info");
+        continue;
+      }
+
+      const changed = patchModelsJson((cfg) => setSampling(cfg, providerId, modelId, at, key, value));
+      if (!changed) {
+        ctx.ui.notify(
+          modelsJsonUnreadable()
+            ? "models.json could not be parsed — nothing written"
+            : `${where} · ${key}: no change`,
+          modelsJsonUnreadable() ? "error" : "info",
+        );
+        continue;
+      }
+      dirty = true;
+      // The next iteration re-reads models.json, so the list shows the new value
+      ctx.ui.notify(`${where} · ${key} ${value === undefined ? "removed" : `= ${num(value)}`}`, "info");
+    }
   }
-  const written = value === undefined ? `${label} cleared` : `${label} = ${num(value)}`;
+
+  if (!dirty) return;
   if (modelId !== current.id) {
-    ctx.ui.notify(`${written} — applies when you switch to ${modelId}`, "info");
+    ctx.ui.notify(`sampling tuned for ${modelId} — applies when you switch to it`, "info");
     return;
   }
+  // One re-apply for the whole session of edits, not one per key
   const applied = await reapplyModel(pi, ctx, providerId, modelId);
-  ctx.ui.notify(`${written} — ${applied ? "applied to this session" : "saved; /reload to apply"}`, applied ? "info" : "warning");
+  ctx.ui.notify(
+    applied ? `sampling for ${modelId} applied to this session` : `sampling for ${modelId} saved; /reload to apply`,
+    applied ? "info" : "warning",
+  );
 }
 
 export default function llamaLinkExtension(pi: ExtensionAPI) {

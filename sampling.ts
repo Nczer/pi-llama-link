@@ -162,6 +162,54 @@ export function effectiveOverride(config: any, providerId: string, modelId: stri
   return out;
 }
 
+/** Where the value a level actually uses comes from. */
+export type Provenance = "level" | "global" | "server" | "unset";
+
+export function keyProvenance(
+  override: SamplingOverride | undefined,
+  serverDefaults: SamplingMap | undefined,
+  target: SamplingTarget,
+  key: SamplingKey,
+): { source: Provenance; value?: number } {
+  if (target !== "all") {
+    const own = override?.samplingParamsByThinkingLevel?.[target]?.[key];
+    if (own !== undefined) return { source: "level", value: own };
+  }
+  const global = override?.samplingParams?.[key];
+  if (global !== undefined) return { source: "global", value: global };
+  const server = serverDefaults?.[key];
+  if (server !== undefined) return { source: "server", value: server };
+  return { source: "unset" };
+}
+
+/**
+ * Key-select item: the value plus the layer it comes from. A level that inherits
+ * says so instead of repeating a number it does not own.
+ */
+export function formatKeyItem(target: SamplingTarget, key: SamplingKey, prov: { source: Provenance; value?: number }): string {
+  switch (prov.source) {
+    case "level": return `${key} = ${num(prov.value!)} (this level)`;
+    case "global": return target === "all"
+      ? `${key} = ${num(prov.value!)} (global)`
+      : `${key} = ${num(prov.value!)} (same as global)`;
+    case "server": return `${key} = ${num(prov.value!)} (server)`;
+    default: return `${key} — unset`;
+  }
+}
+
+/**
+ * Level-select item: what this target contributes, never the merged result —
+ * a level with nothing of its own is the default and says "same as global".
+ */
+export function formatTargetItem(target: SamplingTarget, override: SamplingOverride | undefined): string {
+  if (target === "all") {
+    const s = formatSampling(override?.samplingParams || {});
+    return s ? `all levels (global) — set: ${s}` : "all levels (global) — nothing set";
+  }
+  const s = formatSampling(override?.samplingParamsByThinkingLevel?.[target] || {});
+  return s ? `${target} — own: ${s}` : `${target} — same as global`;
+}
+
 /** Values in effect for one level: server defaults, then flat, then the level entry. */
 export function effectiveSampling(
   override: SamplingOverride | undefined,
@@ -264,7 +312,7 @@ export function describeOverride(override: SamplingOverride | undefined): string
   const parts: string[] = [];
   if (override?.samplingParams) {
     const s = formatSampling(override.samplingParams);
-    if (s) parts.push(`all: ${s}`);
+    if (s) parts.push(`global: ${s}`);
   }
   const levels = override?.samplingParamsByThinkingLevel || {};
   for (const level of LEVELS) {
