@@ -34,7 +34,7 @@ export const STATUS_ICONS: Record<string, string> = {
 
 /**
  * A focused overlay renders on every TUI pass, but keyboard input routes to
- * the FOCUSED component — so when another UI (a consult/quiz/halter prompt,
+ * the FOCUSED component — so when another UI (a consult/halter prompt,
  * a native selector, …) takes focus, this overlay would stay visible while
  * being impossible to dismiss. Render-time check: if we are visible but no
  * longer focused, close ourselves so the prompt underneath is reachable.
