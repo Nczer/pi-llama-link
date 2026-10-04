@@ -7,7 +7,7 @@ import { loadExtSettings, patchExtSettings } from "../ext-settings";
 let dir: string;
 let file: string;
 
-const DEFAULTS = { enabled: true, serverUrl: "http://127.0.0.1:8080", remoteUrl: null };
+const DEFAULTS = { serverUrl: "http://127.0.0.1:8080", remoteUrl: null };
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "llama-link-test-"));
@@ -29,9 +29,9 @@ describe("loadExtSettings", () => {
   });
 
   it("writes back materialized keys without clobbering other extensions", () => {
-    writeFileSync(file, JSON.stringify({ "other-ext": { keep: true }, "llama-link": { enabled: false } }));
+    writeFileSync(file, JSON.stringify({ "other-ext": { keep: true }, "llama-link": { remoteUrl: "http://r:1" } }));
     const s = loadExtSettings("llama-link", DEFAULTS, file);
-    expect(s.enabled).toBe(false);
+    expect(s.remoteUrl).toBe("http://r:1");
     const raw = JSON.parse(readFileSync(file, "utf8"));
     expect(raw["other-ext"]).toEqual({ keep: true });
     expect(raw["llama-link"].serverUrl).toBe("http://127.0.0.1:8080");
@@ -57,11 +57,11 @@ describe("loadExtSettings", () => {
 
 describe("patchExtSettings", () => {
   it("patches keys and preserves other extensions", () => {
-    writeFileSync(file, JSON.stringify({ other: { a: 1 }, "llama-link": { enabled: true } }));
-    patchExtSettings("llama-link", { enabled: false }, file);
+    writeFileSync(file, JSON.stringify({ other: { a: 1 }, "llama-link": { serverUrl: "http://127.0.0.1:8080" } }));
+    patchExtSettings("llama-link", { serverUrl: "http://patched:1" }, file);
     const raw = JSON.parse(readFileSync(file, "utf8"));
     expect(raw.other).toEqual({ a: 1 });
-    expect(raw["llama-link"].enabled).toBe(false);
+    expect(raw["llama-link"].serverUrl).toBe("http://patched:1");
   });
 
   it("deletes keys patched to undefined", () => {
@@ -72,8 +72,8 @@ describe("patchExtSettings", () => {
   });
 
   it("creates the namespace when absent", () => {
-    patchExtSettings("llama-link", { enabled: false }, file);
+    patchExtSettings("llama-link", { remoteUrl: "http://r:1" }, file);
     const raw = JSON.parse(readFileSync(file, "utf8"));
-    expect(raw["llama-link"]).toEqual({ enabled: false });
+    expect(raw["llama-link"]).toEqual({ remoteUrl: "http://r:1" });
   });
 });

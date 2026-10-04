@@ -62,7 +62,7 @@ const DEAD = "http://127.0.0.1:1"; // connection refused
 
 function useSettings(serverUrl: string, remoteUrl: string | null): void {
   writeFileSync(join(agentDir, "settings-ext.json"), JSON.stringify({
-    "llama-link": { enabled: true, serverUrl, remoteUrl },
+    "llama-link": { serverUrl, remoteUrl },
   }));
   server.resetSettingsCache();
 }

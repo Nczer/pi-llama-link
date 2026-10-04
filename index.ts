@@ -17,7 +17,6 @@ import {
   resetDiscoveryState,
   loadMetadataOverlay,
 } from "./metadata";
-import { patchExtSettings } from "./ext-settings";
 import {
   syncToModelsJson,
   flushModelsWrite,
@@ -45,8 +44,6 @@ import {
   PROVIDER_NAME,
   PROVIDER_IDS,
   rpc,
-  loadSettings,
-  resetSettingsCache,
   clearCaches,
   detectMode,
   resolveServers,
@@ -71,10 +68,6 @@ import {
 // Settings loading, server resolution, per-server auth: server.ts.
 // Metadata store + lazy /props discovery: metadata.ts.
 // models.json sync: sync.ts.
-
-function isLlamaStatusEnabled(): boolean {
-  return loadSettings().enabled !== false; // default true
-}
 
 // Dedup for the "llama" status-bar slot. Watcher polls fire faster than
 // the displayed string changes, so redundant setStatus calls (and the
@@ -113,13 +106,13 @@ async function switchPiModel(
     apiId = modelsJsonApiId(server.id, m);
   }
   if (!apiId) {
-    ctx.ui.notify(`${m.aliases?.[0] || m.id} missing from models.json — /llama-sync then /reload`, "error");
+    ctx.ui.notify(`${m.aliases?.[0] || m.id} missing from models.json — the sync did not get it from the server`, "error");
     return false;
   }
   await ctx.modelRegistry.refresh({ providers: [server.id] }).catch(() => {});
   const model = ctx.modelRegistry.find(server.id, apiId);
   if (!model) {
-    ctx.ui.notify(`${apiId} not found in model registry — /llama-sync then /reload`, "error");
+    ctx.ui.notify(`${apiId} is in models.json but not in the model registry — /reload re-reads models.json`, "error");
     return false;
   }
   const ok = await pi.setModel(model);
@@ -309,6 +302,12 @@ async function loadModelCmd(pi: ExtensionAPI, ctx: ExtensionCommandContext, mode
     if (loaded) await switchToLoaded(pi, ctx, server, modelArg);
     return;
   }
+
+  // Opening the picker is the moment a user wants a model available, so this is
+  // where a refresh belongs: a model added to a server since the session started
+  // becomes loadable and switchable (there is no manual sync command).
+  await syncToModelsJson(info).catch(() => {});
+  flushModelsWrite();
 
   const inspector = new ModelInspector(server);
   let models = (await inspector.list()).filter((m) => !isAutoExposedCacheEntry(m));
@@ -593,13 +592,20 @@ async function samplingCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext): 
     return;
   }
 
-  const config = readModelsJson();
-  const entries: any[] = config.providers[providerId]?.models || [];
+  let config = readModelsJson();
+  let entries: any[] = config.providers[providerId]?.models || [];
+  if (entries.length === 0 && !modelsJsonUnreadable()) {
+    // Self-heal like the model-switch paths do: sync the provider, then re-read
+    await syncToModelsJson().catch(() => {});
+    flushModelsWrite();
+    config = readModelsJson();
+    entries = config.providers[providerId]?.models || [];
+  }
   if (entries.length === 0 || modelsJsonUnreadable()) {
     ctx.ui.notify(
       modelsJsonUnreadable()
         ? "models.json could not be parsed — fix it before tuning sampling"
-        : `${current.id} missing from models.json — /llama-sync first`,
+        : `no ${PROVIDER_NAME} model in models.json — the servers reported nothing to sync`,
       "error",
     );
     return;
@@ -617,7 +623,7 @@ async function samplingCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext): 
   const model =
     ctx.modelRegistry.find(providerId, modelId) ?? entries.find((e) => e.id === modelId);
   if (!model) {
-    ctx.ui.notify(`${modelId} not found in the model registry — /llama-sync then /reload`, "error");
+    ctx.ui.notify(`${modelId} is not in the model registry — /reload re-reads models.json`, "error");
     return;
   }
 
@@ -726,18 +732,6 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("llama-sync", {
-    description: `Sync ${PROVIDER_NAME} models to models.json`,
-    handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      const wrote = await syncToModelsJson();
-      if (modelsJsonUnreadable()) {
-        ctx.ui.notify("models.json could not be parsed — left untouched, fix it first", "error");
-        return;
-      }
-      ctx.ui.notify(wrote ? `${PROVIDER_NAME} models synced` : `${PROVIDER_NAME} models already up to date`, "info");
-    },
-  });
-
   pi.registerCommand("llama-sampling", {
     description: `Tune ${PROVIDER_NAME} sampling per thinking level`,
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
@@ -746,7 +740,6 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event: any, ctx: ExtensionContext) => {
-    if (!isLlamaStatusEnabled()) return;
     try {
       // One /models fetch per server, shared by sync and the loaded-model notice
       const serverInfo = await gatherServers();
@@ -797,7 +790,6 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
   // ── Event Handlers ──────────────────────────────────────────────────
 
   pi.on("before_provider_request", (event, ctx) => {
-    if (!isLlamaStatusEnabled()) return;
     const model = ctx.model;
     const provider = (model as any)?.provider;
     if (!PROVIDER_IDS.includes(provider || "")) return;
@@ -825,7 +817,6 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
     const provider = (ctx.model as any)?.provider;
     if (PROVIDER_IDS.includes(provider || "")) stopInflightWatch();
 
-    if (!isLlamaStatusEnabled()) return;
     if (event.status !== 200) return;
     if (!ctx.model) return;
     if (!PROVIDER_IDS.includes(provider || "")) return;
@@ -838,22 +829,6 @@ export default function llamaLinkExtension(pi: ExtensionAPI) {
         void syncToModelsJson(undefined, (v) => setLlamaStatus(ctx, v)).catch(() => {});
       },
     });
-  });
-
-  pi.registerCommand("llama-link", {
-    description: "Toggle llama-link extension on/off",
-    handler: async (_args, ctx) => {
-      // Re-read fresh from disk to avoid clobbering external edits
-      resetSettingsCache();
-      const next = !loadSettings().enabled;
-      patchExtSettings("llama-link", { enabled: next });
-      loadSettings(); // re-read patched value, warm the server.ts cache
-      if (!next) {
-        stopInflightWatch();
-        setLlamaStatus(ctx, undefined);
-      }
-      ctx.ui.notify(next ? "Llama link enabled" : "Llama link disabled", next ? "info" : "warning");
-    },
   });
 
 }

@@ -12,10 +12,8 @@ Requires Pi ≥ 0.80.6 (uses the `max` thinking tier).
 | `/llama-unload` | Unload the current model if it's from a llama.cpp provider |
 | `/llama-load` | Open model picker to load a model (router mode); Pi's current model switches to it |
 | `/llama-load <id>` | Load a specific model by ID (router mode); Pi's current model switches to it |
-| `/llama-sync` | Manually sync all server models to `models.json` |
 | `/llama-sampling` | Tune generation sampling per thinking level (writes `models.json` `modelOverrides`) |
 | `/llama-version` | Print `llama-server --version` output |
-| `/llama-link` | Toggle llama-link extension on/off |
 
 ## Servers
 
@@ -40,9 +38,10 @@ Priority order: `LLAMA_SERVER_URL` env → `serverUrl` setting → `127.0.0.1:80
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `enabled` | `true` | Toggle extension on/off via `/llama-link` |
 | `serverUrl` | `http://127.0.0.1:8080` | Local server URL (overridden by env var) |
 | `remoteUrl` | None | Remote server URL (opt-in) |
+
+Loading is all-or-nothing: pi auto-scans `~/.pi/agent/extensions/`, so to silence the extension move its folder out (e.g. `llama-link.disabled`) and `/reload`, or run `pi --no-extensions`.
 
 ## Inflight Progress
 
@@ -58,7 +57,13 @@ The `/llama-load` command has its own progress display (SSE with polling fallbac
 
 ## Auto-Sync
 
-On `session_start`, syncs model metadata to `~/.pi/agent/models.json`.
+Syncs model metadata to `~/.pi/agent/models.json` whenever models are needed — there is no manual sync command:
+
+- `session_start`
+- after model metadata is (re)discovered from a server
+- when `/llama-load` opens its picker, so a model added to a server mid-session becomes loadable
+- before a model switch, when the entry the switch needs is missing from `models.json`
+- when `/llama-sampling` finds no entry for the provider
 
 - `id`, `input` (capabilities), `contextWindow`, `maxTokens` (no `name` field — Pi displays the id). `contextWindow`/`maxTokens` are omitted when neither the server nor models.json records a size.
 - Model `id` uses the model's first alias when present (e.g. `Qwen3.8-27B` instead of `Qwen3.8-27B-Q4_K_XL`). llama.cpp resolves aliases on every endpoint (`/v1/chat/completions`, `/props`, `/slots`, `/models/load|unload`), so the alias is directly usable as the request model. Real ids are always reserved; on alias collision the first model wins.

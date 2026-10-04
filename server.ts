@@ -43,13 +43,11 @@ export interface ServerInfo {
 /** Extension settings: the "llama-link" namespace of the shared
  *  settings-ext.json (defaults materialized on first load). */
 export interface LlamaLinkSettings {
-  enabled: boolean;
   serverUrl: string;
   remoteUrl: string | null;
 }
 
 export const LLAMA_LINK_DEFAULTS: LlamaLinkSettings = {
-  enabled: true,
   serverUrl: "http://127.0.0.1:8080",
   remoteUrl: null,
 };
