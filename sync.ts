@@ -25,19 +25,71 @@ import {
   migrateMetadataKeys,
   applyMetadataOverlay,
 } from "./metadata";
+import { carrySamplingFields, sameSampling } from "./sampling";
 import { atomicWrite, agentDir } from "./ext-settings";
 
 const MODELS_JSON = join(agentDir(), "models.json");
 
-interface ModelsJson {
+export interface ModelsJson {
   providers: Record<string, any>;
 }
 
+let modelsJsonParseFailed = false;
+
 function loadModelsJson(): ModelsJson {
+  modelsJsonParseFailed = false;
   if (existsSync(MODELS_JSON)) {
-    try { return JSON.parse(readFileSync(MODELS_JSON, "utf-8")); } catch {}
+    try {
+      return JSON.parse(stripJsonComments(stripBom(readFileSync(MODELS_JSON, "utf-8"))));
+    } catch {
+      // An existing file we cannot read must never be treated as empty: the
+      // sync would then write a file holding only the llama providers
+      modelsJsonParseFailed = true;
+    }
   }
   return { providers: {} };
+}
+
+/**
+ * true when the last models.json read hit an existing but unparsable file.
+ * Writers refuse to touch the file in that state.
+ */
+export function modelsJsonUnreadable(): boolean {
+  return modelsJsonParseFailed;
+}
+
+/**
+ * pi tolerates // comments and trailing commas in models.json
+ * (coding-agent src/utils/json.ts stripJsonComments + stripBom); the same
+ * tolerance is needed here or a commented file reads as empty.
+ */
+function stripJsonComments(text: string): string {
+  return text
+    .replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (m) => (m[0] === '"' ? m : ""))
+    .replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (m, tail) => tail ?? (m[0] === '"' ? m : ""));
+}
+
+function stripBom(text: string): string {
+  return text.replace(/^\uFEFF/, "");
+}
+
+export function readModelsJson(): ModelsJson {
+  return loadModelsJson();
+}
+
+/**
+ * Read-modify-write models.json outside the sync path (the /llama-sampling
+ * editor). A pending debounced sync write is flushed first so the two writers
+ * cannot clobber each other; the file is only touched when `mutate` reports a
+ * change.
+ */
+export function patchModelsJson(mutate: (config: ModelsJson) => boolean): boolean {
+  flushModelsWrite();
+  const config = loadModelsJson();
+  if (modelsJsonParseFailed) return false;
+  if (!mutate(config)) return false;
+  atomicWrite(MODELS_JSON, JSON.stringify(config, null, 2) + "\n");
+  return true;
 }
 
 /**
@@ -78,7 +130,7 @@ export function resolveApiIds(models: ModelsDataProperty[]): Map<string, string>
 
 export function modelsChanged(
   existing: any[],
-  incoming: Array<{ id: string; contextWindow?: number; input: string[]; reasoning?: boolean }>,
+  incoming: Array<Record<string, any>>,
 ): boolean {
   if (existing.length !== incoming.length) return true;
   const existingMap = new Map(existing.map((m: any) => [m.id, m]));
@@ -90,6 +142,7 @@ export function modelsChanged(
     if (match.contextWindow !== m.contextWindow) return true;
     if (Boolean(m.reasoning) !== Boolean(match.reasoning)) return true;
     if ((match.input || []).join(",") !== m.input.join(",")) return true;
+    if (!sameSampling(match, m)) return true;
   }
   return false;
 }
@@ -140,6 +193,7 @@ export async function syncToModelsJson(
 ): Promise<boolean> {
   const info = serverInfo ?? (await gatherServers());
   const config = loadModelsJson();
+  if (modelsJsonParseFailed) return false; // refuse to overwrite what we can't read
   const overlay = loadMetadataOverlay();
   let overlayDirty = false;
   let wrote = false;
@@ -184,17 +238,23 @@ export async function syncToModelsJson(
 
     // Re-key persisted metadata from real ids to alias ids so overrides survive
     if (migrateMetadataKeys(overlay, server.id, apiIds)) overlayDirty = true;
+    const existing = config.providers[server.id]?.models || [];
     const modelsWithOverlay = modelConfigs.map(m => {
       const { id, input, contextWindow, maxTokens, cost } = m;
       const result: any = { id, input, contextWindow, maxTokens, cost };
       applyMetadataOverlay(result, server.id, overlay);
+      // Tuning lives in modelOverrides (pi merges it last), but a hand-written
+      // models[].samplingParams is carried across too so a sync never deletes it
+      carrySamplingFields(existing.find((e: any) => e.id === id), result);
       return result;
     });
 
-    const existing = config.providers[server.id]?.models || [];
     if (!modelsChanged(existing, modelsWithOverlay)) continue;
 
+    // Spread the existing provider so user-owned provider keys (modelOverrides,
+    // headers, compat, ...) survive a rewrite of the ones llama-link owns
     config.providers[server.id] = {
+      ...config.providers[server.id],
       baseUrl: server.url + "/v1",
       api: "openai-completions",
       apiKey: resolveApiKey(server.id),

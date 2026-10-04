@@ -10,6 +10,7 @@ import { writeFileSync, readFileSync, rmSync, mkdirSync, mkdtempSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import http from "node:http";
+import { setSampling } from "../sampling";
 
 const home = mkdtempSync(join(tmpdir(), "llama-link-sync-"));
 process.env.HOME = home;
@@ -201,5 +202,134 @@ describe("syncToModelsJson with an unreported context size", () => {
     expect(await sync.syncToModelsJson(undefined, (v) => notified.push(v))).toBe(false); // unchanged → no rewrite
     const entry = JSON.parse(readFileSync(modelsFile, "utf-8")).providers["llama-cpp"].models[0];
     expect(entry.contextWindow).toBe(8192);
+  });
+});
+
+
+// ── User-owned sampling config (modelOverrides, patch writes, parse tolerance)
+describe("user sampling config in models.json", () => {
+  // One fake server for the writes below: always reports short-1 @ 8192
+  const srvModels = [{ id: "real-1", aliases: ["short-1"], architecture: { input_modalities: ["text", "image"] }, meta: { n_ctx: 8192 } }];
+  let server: http.Server;
+
+  beforeAll(async () => {
+    server = http.createServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ models: srvModels, data: srvModels }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    process.env.LLAMA_SERVER_URL = `http://127.0.0.1:${(server.address() as any).port}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  describe("syncToModelsJson keeps it", () => {
+    it("rewrites model entries without dropping modelOverrides, provider keys, or hand-written samplingParams", async () => {
+      writeFileSync(
+        modelsFile,
+        JSON.stringify({
+          providers: {
+            "llama-cpp": {
+              baseUrl: "http://127.0.0.1:9/v1",
+              api: "openai-completions",
+              apiKey: "sk-placeholder",
+              headers: { "x-user": "keep me" },
+              models: [{
+                id: "short-1",
+                input: ["text", "image"],
+                contextWindow: 4096, // stale on purpose: forces a rewrite
+                maxTokens: 4096,
+                reasoning: false,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                samplingParams: { temperature: 1 },
+              }],
+              modelOverrides: {
+                "short-1": { samplingParamsByThinkingLevel: { off: { temperature: 0.2 } } },
+                other: { contextWindow: 4096 },
+              },
+            },
+          },
+        }),
+      );
+
+      expect(await sync.syncToModelsJson()).toBe(true);
+      sync.flushModelsWrite();
+
+      const provider = JSON.parse(readFileSync(modelsFile, "utf-8")).providers["llama-cpp"];
+      expect(provider.headers).toEqual({ "x-user": "keep me" });
+      expect(provider.modelOverrides).toEqual({
+        "short-1": { samplingParamsByThinkingLevel: { off: { temperature: 0.2 } } },
+        other: { contextWindow: 4096 },
+      });
+      expect(provider.models[0].contextWindow).toBe(8192);
+      expect(provider.models[0].samplingParams).toEqual({ temperature: 1 });
+    });
+
+    it("a carried samplingParams is not seen as drift (no rewrite churn)", async () => {
+      expect(await sync.syncToModelsJson()).toBe(false);
+    });
+  });
+
+  describe("patchModelsJson", () => {
+    it("writes a mutation into modelOverrides", () => {
+      writeFileSync(modelsFile, JSON.stringify({ providers: { "llama-cpp": { models: [{ id: "m1" }] } } }));
+      expect(sync.patchModelsJson((cfg) => setSampling(cfg, "llama-cpp", "m1", "off", "top_k", 20))).toBe(true);
+      expect(JSON.parse(readFileSync(modelsFile, "utf-8")).providers["llama-cpp"].modelOverrides)
+        .toEqual({ m1: { samplingParamsByThinkingLevel: { off: { top_k: 20 } } } });
+    });
+
+    it("a no-op mutate does not touch the file", () => {
+      const before = JSON.stringify({ providers: { "llama-cpp": { models: [{ id: "m1" }] } } });
+      writeFileSync(modelsFile, before);
+      expect(sync.patchModelsJson(() => false)).toBe(false);
+      expect(readFileSync(modelsFile, "utf-8")).toBe(before);
+    });
+
+    it("flushes a pending debounced sync write first, so the patch survives it", async () => {
+      rmSync(modelsFile, { force: true });
+      expect(await sync.syncToModelsJson()).toBe(true); // schedules a debounced write
+      sync.patchModelsJson((cfg) => setSampling(cfg, "llama-cpp", "short-1", "all", "temperature", 0.6));
+      sync.flushModelsWrite(); // must not rewrite the pre-patch snapshot
+      const provider = JSON.parse(readFileSync(modelsFile, "utf-8")).providers["llama-cpp"];
+      expect(provider.models[0].id).toBe("short-1");
+      expect(provider.modelOverrides).toEqual({ "short-1": { samplingParams: { temperature: 0.6 } } });
+    });
+
+    it("refuses an unparsable models.json instead of replacing it", () => {
+      const broken = "{ providers: this is not json";
+      writeFileSync(modelsFile, broken);
+      expect(sync.patchModelsJson((cfg) => setSampling(cfg, "llama-cpp", "m1", "all", "top_k", 20))).toBe(false);
+      expect(sync.modelsJsonUnreadable()).toBe(true);
+      expect(readFileSync(modelsFile, "utf-8")).toBe(broken);
+    });
+  });
+
+  describe("parsing tolerance", () => {
+    it("comments and trailing commas read the way pi reads them (other providers survive)", async () => {
+      writeFileSync(
+        modelsFile,
+        "\uFEFF{\n  // my own provider\n  \"providers\": {\n    \"ollama\": { \"baseUrl\": \"http://127.0.0.1:11434/v1\", \"models\": [{ \"id\": \"keep\" }], },\n  },\n}\n",
+      );
+      expect(await sync.syncToModelsJson()).toBe(true);
+      sync.flushModelsWrite();
+      const file = JSON.parse(readFileSync(modelsFile, "utf-8"));
+      expect(Object.keys(file.providers).sort()).toEqual(["llama-cpp", "ollama"]);
+      expect(file.providers.ollama.models[0].id).toBe("keep");
+    });
+
+    it("a // inside a string is not eaten", () => {
+      writeFileSync(modelsFile, JSON.stringify({ providers: { ollama: { apiKey: "//not-a-comment" } } }));
+      expect(sync.readModelsJson().providers.ollama.apiKey).toBe("//not-a-comment");
+    });
+
+    it("sync leaves a file it cannot parse untouched", async () => {
+      const broken = "{ not json at all";
+      writeFileSync(modelsFile, broken);
+      expect(await sync.syncToModelsJson()).toBe(false);
+      expect(sync.modelsJsonUnreadable()).toBe(true);
+      expect(readFileSync(modelsFile, "utf-8")).toBe(broken);
+    });
   });
 });
